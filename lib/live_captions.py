@@ -38,7 +38,8 @@ import unicodedata
 import wave
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+TESTED_WHISPER_CPP_VERSION = "1.9.1"
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
@@ -49,13 +50,30 @@ OVERLAP_BYTES = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH * OVERLAP_SECONDS
 READ_BYTES = 4096
 MAX_QUEUE_CHUNKS = 64
 MAX_HTTP_RESPONSE = 1_048_576
+MAX_CAPABILITY_OUTPUT = 262_144
+CAPTURE_START_TIMEOUT = 5.0
+MAX_CAPTURE_BACKLOG_SECONDS = WINDOW_SECONDS - OVERLAP_SECONDS
 # Conservative silence-only gate (~-54 dBFS), not an aggressive speech VAD.
 SILENCE_RMS_THRESHOLD = 0.002
 VALID_SOURCES = ("microphone", "desktop")
 REQUIRED_WHISPER_SERVER_FLAGS = ("--model", "--host", "--port", "--request-path", "--public")
-LANGUAGE_RE = re.compile(r"^(?:auto|[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*)$")
+LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$")
+WHISPER_LANGUAGES = frozenset(
+  (
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy",
+    "da", "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
+    "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn",
+    "ko", "la", "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sd", "si",
+    "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+    "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "yue", "zh",
+  )
+)
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-TOKEN_RE = re.compile(r"[^\w']+", re.UNICODE)
+UNSEGMENTED_SCRIPT_RE = re.compile(
+  r"[\u0e00-\u0eff\u0f00-\u109f\u1780-\u17ff\u3040-\u30ff"
+  r"\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]"
+)
 
 
 class CaptionError(RuntimeError):
@@ -72,7 +90,10 @@ def clean_message(value: object, limit: int = 500) -> str:
   text = "".join(
     character
     for character in text
-    if unicodedata.category(character) not in ("Cc", "Cf") or character in "\t\n\r"
+    if (
+      unicodedata.category(character) not in ("Cc", "Cf")
+      or character in "\t\n\r\u200c\u200d"
+    )
   )
   text = re.sub(r"\s+", " ", text).strip()
   if len(text) > limit:
@@ -151,6 +172,8 @@ def runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
     or info.st_uid != os.getuid()
   ):
     raise CaptionError("unsafe-runtime", "XDG_RUNTIME_DIR must be a user-owned directory, not a symlink.")
+  if not os.access(base, os.W_OK | os.X_OK):
+    raise CaptionError("runtime-unavailable", "The XDG runtime directory is not writable.")
   return base / "omarchy-live-captions"
 
 
@@ -173,9 +196,17 @@ def default_config() -> dict[str, Any]:
 
 def validate_language(value: object) -> str:
   language = str(value or "en").strip()
-  if len(language) > 24 or not LANGUAGE_RE.fullmatch(language):
-    raise CaptionError("invalid-language", "Language must be 'auto' or a short language token such as en or pt-BR.")
-  return language.replace("_", "-")
+  if language.casefold() == "auto":
+    return "auto"
+  if len(language) > 35 or not LANGUAGE_RE.fullmatch(language):
+    raise CaptionError(
+      "invalid-language",
+      "Language must be 'auto', a Whisper language code, or a BCP-47 tag such as pt-BR.",
+    )
+  primary = language.split("-", 1)[0].lower()
+  if primary not in WHISPER_LANGUAGES:
+    raise CaptionError("invalid-language", f"Whisper does not support the language code '{primary}'.")
+  return primary
 
 
 def validate_source(value: object) -> str:
@@ -230,19 +261,30 @@ def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     raise
 
 
-def _model_rank(path: Path) -> tuple[int, str]:
-  preferences = (
-    "ggml-base.en.bin",
-    "ggml-small.en.bin",
-    "ggml-tiny.en.bin",
-    "ggml-base.bin",
-    "ggml-small.bin",
-    "ggml-tiny.bin",
-  )
+def english_only_model(path: Path) -> bool:
+  return re.search(r"\.en(?:[-.]|$)", path.name, re.IGNORECASE) is not None
+
+
+def model_language_issue(path: Path, language: str) -> str:
+  if language != "en" and english_only_model(path):
+    return (
+      f"The model {path.name} is English-only and cannot caption language '{language}'. "
+      "Choose a multilingual model or select English."
+    )
+  return ""
+
+
+def _model_rank(path: Path, language: str = "en") -> tuple[int, str]:
+  # Caption latency matters more than benchmark accuracy for automatic
+  # discovery. Prefer the tiny model, while still honoring an explicitly
+  # configured model verbatim.
+  multilingual = ("ggml-tiny.bin", "ggml-base.bin", "ggml-small.bin")
+  english = ("ggml-tiny.en.bin", "ggml-base.en.bin", "ggml-small.en.bin")
+  preferences = english + multilingual if language == "en" else multilingual
   try:
-    return (preferences.index(path.name), path.name)
+    return (preferences.index(path.name), str(path))
   except ValueError:
-    return (len(preferences), path.name)
+    return (len(preferences), str(path))
 
 
 def known_model_directories(environ: Mapping[str, str] | None = None) -> list[Path]:
@@ -251,6 +293,7 @@ def known_model_directories(environ: Mapping[str, str] | None = None) -> list[Pa
   data = Path(env.get("XDG_DATA_HOME") or (home / ".local" / "share"))
   cache = Path(env.get("XDG_CACHE_HOME") or (home / ".cache"))
   return [
+    data / "omarchy-live-captions" / "models",
     data / "voxtype" / "models",
     data / "whisper.cpp" / "models",
     cache / "whisper",
@@ -286,9 +329,11 @@ def discover_model(
   *,
   config: Mapping[str, Any] | None = None,
   environ: Mapping[str, str] | None = None,
+  language: object = None,
 ) -> tuple[Path | None, str, str]:
   env = os.environ if environ is None else environ
   configured = default_config() if config is None else config
+  selected_language = validate_language(language if language is not None else configured.get("language"))
   candidates: list[tuple[object, str]] = []
   if explicit:
     candidates.append((explicit, "argument"))
@@ -299,7 +344,11 @@ def discover_model(
   if candidates:
     value, origin = candidates[0]
     try:
-      return checked_model_path(value), origin, ""
+      candidate = checked_model_path(value)
+      issue = model_language_issue(candidate, selected_language)
+      if issue:
+        return None, origin, issue
+      return candidate, origin, ""
     except CaptionError as error:
       return None, origin, error.message
 
@@ -307,11 +356,22 @@ def discover_model(
   for directory in known_model_directories(env):
     with contextlib.suppress(OSError):
       discovered.extend(path for path in directory.glob("ggml-*.bin") if path.is_file())
-  for candidate in sorted(set(discovered), key=_model_rank):
+  incompatible = False
+  for candidate in sorted(set(discovered), key=lambda path: _model_rank(path, selected_language)):
     try:
-      return checked_model_path(candidate), "discovered", ""
+      checked = checked_model_path(candidate)
+      if model_language_issue(checked, selected_language):
+        incompatible = True
+        continue
+      return checked, "discovered", ""
     except CaptionError:
       continue
+  if incompatible:
+    return (
+      None,
+      "none",
+      f"No multilingual whisper.cpp model was found for language '{selected_language}'.",
+    )
   return None, "none", "No local whisper.cpp GGML model was found. Configure an absolute model path."
 
 
@@ -331,30 +391,59 @@ def executable(name: str) -> str:
   return str(resolved)
 
 
-def whisper_server_capability_issue(binary: str) -> str:
+def whisper_server_capability_issue(binary: str, setpriv_binary: str) -> str:
   """Return a compatibility problem without trusting the command's status."""
+  owned: OwnedProcess | None = None
+  timed_out = False
   try:
-    completed = subprocess.run(
+    owned = spawn_owned(
       [binary, "--help"],
-      stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      timeout=5.0,
-      check=False,
+      label="whisper-help",
+      setpriv_binary=setpriv_binary,
     )
-  except subprocess.TimeoutExpired:
-    return "whisper-server --help timed out; version 1.7.6 or newer is required."
+    assert owned.process.stdout is not None
+    owned.stdout_drain = DiagnosticDrain(
+      owned.process.stdout,
+      "whisper-help-stdout",
+      capture_limit=MAX_CAPABILITY_OUTPUT,
+    )
+    owned.stderr_drain = DiagnosticDrain(
+      owned.process.stderr,
+      "whisper-help-stderr",
+      capture_limit=MAX_CAPABILITY_OUTPUT,
+    )
+    owned.stdout_drain.start()
+    owned.stderr_drain.start()
+    try:
+      owned.process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+      timed_out = True
   except OSError as error:
     return f"Could not inspect whisper-server capabilities: {clean_message(error)}"
+  finally:
+    if owned is not None:
+      if timed_out or owned.process.poll() is None:
+        owned.terminate(grace=0.25)
+      owned.close_streams()
+  if timed_out:
+    return (
+      "whisper-server --help timed out; install the current Arch whisper-cpp package "
+      f"(tested with {TESTED_WHISPER_CPP_VERSION})."
+    )
   # Current releases print help to stderr and may exit zero for unknown
   # options, so inspect bounded option text rather than the exit status.
-  output = (completed.stdout + b"\n" + completed.stderr)[:262_144].decode("utf-8", errors="replace")
+  assert owned is not None and owned.stdout_drain is not None and owned.stderr_drain is not None
+  output = (
+    owned.stdout_drain.captured() + b"\n" + owned.stderr_drain.captured()
+  ).decode("utf-8", errors="replace")
   missing = [flag for flag in REQUIRED_WHISPER_SERVER_FLAGS if flag not in output]
   if missing:
     return (
       "whisper-server is missing required local API options "
       + ", ".join(missing)
-      + "; version 1.7.6 or newer is required."
+      + "; install the current Arch whisper-cpp package "
+      + f"(tested with {TESTED_WHISPER_CPP_VERSION})."
     )
   return ""
 
@@ -393,22 +482,34 @@ def doctor_report(
     issues.append(error.message)
 
   command_paths: dict[str, str] = {}
-  for command_name in ("pw-record", "whisper-server"):
+  for command_name in ("pw-record", "whisper-server", "setpriv"):
     try:
       command_paths[command_name] = executable(command_name)
     except CaptionError as error:
       missing.append(command_name)
       issues.append(error.message)
   whisper_binary = command_paths.get("whisper-server")
-  if whisper_binary:
-    capability_issue = whisper_server_capability_issue(whisper_binary)
+  setpriv_binary = command_paths.get("setpriv")
+  if whisper_binary and setpriv_binary:
+    capability_issue = whisper_server_capability_issue(whisper_binary, setpriv_binary)
     if capability_issue:
       missing.append("compatible whisper-server")
       issues.append(capability_issue)
-  model_path, model_origin, model_issue = discover_model(model, config=config, environ=env)
+  model_path, model_origin, model_issue = discover_model(
+    model,
+    config=config,
+    environ=env,
+    language=selected_language,
+  )
   if model_path is None:
     missing.append("model")
     issues.append(model_issue)
+  runtime_path = ""
+  try:
+    runtime_path = str(runtime_dir(env))
+  except CaptionError as error:
+    missing.append("private runtime directory")
+    issues.append(error.message)
   if not platform_supported():
     missing.append("Linux PipeWire session")
     issues.append("Real audio capture requires Linux with PipeWire; demo mode is still available.")
@@ -434,6 +535,7 @@ def doctor_report(
     "source": selected_source,
     "language": selected_language,
     "commands": command_paths,
+    "runtimePath": runtime_path,
     "windowMs": WINDOW_SECONDS * 1000,
     "overlapMs": OVERLAP_SECONDS * 1000,
     "retainsAudio": False,
@@ -443,9 +545,12 @@ def doctor_report(
 
 def configure_values(model: object, source: object, language: object) -> dict[str, Any]:
   current = load_config()
-  selected_model = checked_model_path(model)
   selected_source = validate_source(source or current.get("source"))
   selected_language = validate_language(language or current.get("language"))
+  selected_model = checked_model_path(model)
+  issue = model_language_issue(selected_model, selected_language)
+  if issue:
+    raise CaptionError("incompatible-model", issue)
   return {
     "schemaVersion": 1,
     "model": str(selected_model),
@@ -482,23 +587,31 @@ def pcm_level(pcm: bytes) -> float:
 
 
 def _normalized_word(word: str) -> str:
-  return TOKEN_RE.sub("", word).casefold()
+  normalized = unicodedata.normalize("NFKC", word).casefold()
+  return "".join(
+    character
+    for character in normalized
+    if character == "'" or unicodedata.category(character)[0] in ("L", "M", "N")
+  )
 
 
 class TranscriptDeduper:
-  """Remove the exact word overlap introduced by rolling audio windows."""
+  """Remove the exact overlap introduced by rolling audio windows."""
 
-  def __init__(self, history_limit: int = 96, compare_limit: int = 48):
+  def __init__(self, history_limit: int = 96, compare_limit: int = 48, character_limit: int = 512):
     self.history_limit = max(8, history_limit)
     self.compare_limit = max(4, min(compare_limit, self.history_limit))
+    self.character_limit = max(32, character_limit)
     self._history: list[str] = []
+    self._character_history = ""
 
   @property
   def history(self) -> tuple[str, ...]:
     return tuple(self._history)
 
   def novel_text(self, text: object) -> str:
-    original = clean_message(text, 4000).split()
+    cleaned = clean_message(text, 4000)
+    original = cleaned.split()
     pairs = [(word, _normalized_word(word)) for word in original]
     pairs = [(word, normalized) for word, normalized in pairs if normalized]
     if not pairs:
@@ -510,13 +623,38 @@ class TranscriptDeduper:
       if self._history[-size:] == normalized[:size]:
         overlap = size
         break
-    novel_pairs = pairs[overlap:]
-    if not novel_pairs:
+    if overlap:
+      novel = " ".join(item[0] for item in pairs[overlap:])
+    else:
+      # Languages such as Chinese and Japanese do not reliably separate
+      # words with spaces. Fall back to a bounded exact suffix/prefix match
+      # so the one-second rolling overlap is not emitted twice.
+      maximum = min(len(cleaned), len(self._character_history), self.character_limit)
+      character_overlap = 0
+      if UNSEGMENTED_SCRIPT_RE.search(cleaned) and UNSEGMENTED_SCRIPT_RE.search(self._character_history):
+        for size in range(maximum, 1, -1):
+          candidate = cleaned[:size]
+          if (
+            UNSEGMENTED_SCRIPT_RE.search(candidate)
+            and self._character_history[-size:] == candidate
+          ):
+            character_overlap = size
+            break
+      novel = cleaned[character_overlap:].lstrip()
+    if not novel:
       return ""
-    novel = " ".join(item[0] for item in novel_pairs)
-    self._history.extend(item[1] for item in novel_pairs)
+    novel_words = []
+    for word in novel.split():
+      normalized_word = _normalized_word(word)
+      if normalized_word:
+        novel_words.append(normalized_word)
+    self._history.extend(novel_words)
     if len(self._history) > self.history_limit:
       self._history = self._history[-self.history_limit :]
+    if UNSEGMENTED_SCRIPT_RE.search(cleaned):
+      self._character_history = (self._character_history + novel)[-self.character_limit :]
+    else:
+      self._character_history = ""
     return novel
 
 
@@ -544,7 +682,7 @@ def multipart_inference_body(wav_bytes: bytes, language: str) -> tuple[bytes, st
     ]
   )
   field("response_format", "json")
-  field("language", language)
+  field("language", validate_language(language))
   chunks.append(f"--{boundary}--\r\n".encode("ascii"))
   return b"".join(chunks), boundary
 
@@ -669,9 +807,11 @@ def arm_parent_death_signal() -> None:
 class DiagnosticDrain:
   """Continuously drain a child pipe while retaining only a few safe lines."""
 
-  def __init__(self, pipe: BinaryIO | None, label: str):
+  def __init__(self, pipe: BinaryIO | None, label: str, capture_limit: int = 0):
     self.pipe = pipe
     self.label = label
+    self.capture_limit = max(0, capture_limit)
+    self._captured = bytearray()
     self.lines: deque[str] = deque(maxlen=8)
     self.thread: threading.Thread | None = None
 
@@ -684,13 +824,26 @@ class DiagnosticDrain:
   def _run(self) -> None:
     assert self.pipe is not None
     while True:
-      chunk = self.pipe.readline(4096)
+      try:
+        chunk = self.pipe.readline(4096)
+      except (OSError, ValueError):
+        return
       if not chunk:
         return
+      remaining = self.capture_limit - len(self._captured)
+      if remaining > 0:
+        self._captured.extend(chunk[:remaining])
       self.lines.append(clean_message(chunk.decode("utf-8", errors="replace"), 300))
 
   def latest(self) -> str:
     return next((line for line in reversed(self.lines) if line), "")
+
+  def captured(self) -> bytes:
+    return bytes(self._captured)
+
+  def join(self, timeout: float = 1.0) -> None:
+    if self.thread is not None:
+      self.thread.join(timeout=max(0.0, timeout))
 
 
 @dataclass
@@ -726,12 +879,31 @@ class OwnedProcess:
     with contextlib.suppress(subprocess.TimeoutExpired):
       self.process.wait(timeout=1.0)
 
+  def close_streams(self) -> None:
+    # Child termination closes the write ends first. Give drain threads a
+    # chance to consume EOF, then close our Popen handles explicitly so
+    # repeated sessions do not leak descriptors in the long-lived helper.
+    for drain in (self.stdout_drain, self.stderr_drain):
+      if drain is not None:
+        drain.join(0.5)
+    for pipe in (self.process.stdout, self.process.stderr):
+      if pipe is not None:
+        with contextlib.suppress(OSError, ValueError):
+          pipe.close()
+    for drain in (self.stdout_drain, self.stderr_drain):
+      if drain is not None:
+        drain.join(0.5)
 
-def spawn_owned(command: Sequence[str], *, stdout: int | BinaryIO, label: str) -> OwnedProcess:
-  actual_command = list(command)
-  setpriv = shutil.which("setpriv") if sys.platform.startswith("linux") else None
-  if setpriv:
-    actual_command = [str(Path(setpriv).resolve()), "--pdeathsig", "TERM", "--", *actual_command]
+
+def spawn_owned(
+  command: Sequence[str],
+  *,
+  stdout: int | BinaryIO,
+  label: str,
+  setpriv_binary: str | None = None,
+) -> OwnedProcess:
+  setpriv = executable("setpriv") if setpriv_binary is None else setpriv_binary
+  actual_command = [setpriv, "--pdeathsig", "KILL", "--", *command]
   process = subprocess.Popen(
     actual_command,
     stdin=subprocess.DEVNULL,
@@ -850,18 +1022,31 @@ class ControlReader:
         self.writer.emit({"type": "error", "code": error.code, "message": error.message})
 
 
+@dataclass(frozen=True)
+class CapturedChunk:
+  data: bytes
+  epoch: int
+  captured_at: float
+
+
 class CaptureReader:
-  def __init__(self, pipe: BinaryIO, stop_event: threading.Event):
+  def __init__(
+    self,
+    pipe: BinaryIO,
+    stop_event: threading.Event,
+    epoch_provider: Callable[[], int] | None = None,
+  ):
     self.pipe = pipe
     self.stop_event = stop_event
-    self.queue: queue.Queue[bytes | None] = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
+    self.epoch_provider = epoch_provider or (lambda: 0)
+    self.queue: queue.Queue[CapturedChunk | None] = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
     self.overflowed = threading.Event()
     self.thread = threading.Thread(target=self._run, name="caption-audio-reader", daemon=True)
 
   def start(self) -> None:
     self.thread.start()
 
-  def _put(self, value: bytes | None) -> None:
+  def _put(self, value: CapturedChunk | None) -> None:
     while not self.stop_event.is_set():
       try:
         self.queue.put_nowait(value)
@@ -876,10 +1061,15 @@ class CaptureReader:
   def _run(self) -> None:
     try:
       while not self.stop_event.is_set():
+        epoch = self.epoch_provider()
         chunk = self.pipe.read(READ_BYTES)
         if not chunk:
           break
-        self._put(chunk)
+        if epoch < 0:
+          # Logical pause keeps PipeWire drained without retaining PCM or
+          # allowing a slow inference request to fill the bounded queue.
+          continue
+        self._put(CapturedChunk(chunk, epoch, time.monotonic()))
     finally:
       self._put(None)
 
@@ -892,11 +1082,21 @@ class CaptureReader:
 
 
 class CaptionSession:
-  def __init__(self, model: Path, source: str, language: str, writer: EventWriter, private_runtime: Path):
+  def __init__(
+    self,
+    model: Path,
+    source: str,
+    language: str,
+    writer: EventWriter,
+    private_runtime: Path,
+    *,
+    setpriv_binary: str | None = None,
+  ):
     self.model = model
     self.source = source
-    self.language = language
+    self.language = validate_language(language)
     self.writer = writer
+    self.setpriv_binary = setpriv_binary
     self.stop_event = threading.Event()
     self.paused = False
     self.started_at = time.monotonic()
@@ -914,6 +1114,7 @@ class CaptionSession:
     self._state_lock = threading.Lock()
     self._cleaned = False
     self.transition_epoch = 0
+    self._prefetched_audio: deque[CapturedChunk] = deque()
 
   def start_server(self, server_binary: str) -> None:
     if self.stop_event.is_set():
@@ -928,6 +1129,7 @@ class CaptionSession:
       ),
       stdout=subprocess.PIPE,
       label="whisper-server",
+      setpriv_binary=self.setpriv_binary,
     )
     if self.stop_event.is_set():
       self.request_stop()
@@ -945,6 +1147,7 @@ class CaptionSession:
       capture_command(capture_binary, self.source),
       stdout=subprocess.PIPE,
       label="pw-record",
+      setpriv_binary=self.setpriv_binary,
     )
     if self.stop_event.is_set():
       self.request_stop()
@@ -952,8 +1155,16 @@ class CaptionSession:
     assert self.capture.process.stdout is not None
     if self.capture.stderr_drain is not None:
       self.capture.stderr_drain.start()
-    self.reader = CaptureReader(self.capture.process.stdout, self.stop_event)
+    self.reader = CaptureReader(
+      self.capture.process.stdout,
+      self.stop_event,
+      self._capture_epoch,
+    )
     self.reader.start()
+
+  def _capture_epoch(self) -> int:
+    with self._state_lock:
+      return -1 if self.paused else self.transition_epoch
 
   def _status(self, state: str) -> dict[str, Any]:
     return {
@@ -963,48 +1174,124 @@ class CaptionSession:
       "elapsedSeconds": max(0, int(time.monotonic() - self.started_at)),
     }
 
+  def _emit_heartbeat(self, now: float) -> None:
+    with self._state_lock:
+      self.writer.emit(
+        {
+          "type": "heartbeat",
+          "state": "paused" if self.paused else "listening",
+          "source": self.source,
+          "elapsedSeconds": max(0, int(now - self.started_at)),
+        }
+      )
+
   def handle_control(self, command: str) -> Mapping[str, Any]:
     if command == "pause":
       with self._state_lock:
         if self.paused:
           return {"ok": True, "state": "paused"}
-      if self.capture is None or not self.capture.signal(signal.SIGSTOP):
-        raise CaptionError("capture-stopped", "The owned audio capture is no longer running.")
-      with self._state_lock:
+        if self.capture is None or self.capture.process.poll() is not None:
+          raise CaptionError("capture-stopped", "The owned audio capture is no longer running.")
+        # Keep PipeWire draining while paused. Suspending pw-record would leave
+        # buffered audio to be delivered on Resume; continuous draining gives
+        # Resume a clean audio boundary instead.
         self.paused = True
         self.transition_epoch += 1
-      if self.reader is not None:
-        self.reader.discard_pending()
-      self.writer.emit(self._status("paused"))
-      return {"ok": True, "state": "paused"}
+        self._prefetched_audio.clear()
+        if self.reader is not None:
+          self.reader.discard_pending()
+          self.reader.overflowed.clear()
+        self.writer.emit(self._status("paused"))
+        return {"ok": True, "state": "paused"}
     if command == "resume":
       with self._state_lock:
         if not self.paused:
-          raise CaptionError("not-paused", "The caption session is not paused.")
-      if self.reader is not None:
-        self.reader.discard_pending()
-      if self.capture is None or not self.capture.signal(signal.SIGCONT):
-        raise CaptionError("capture-stopped", "The owned audio capture is no longer running.")
-      with self._state_lock:
+          return {"ok": True, "state": "listening"}
+        self._prefetched_audio.clear()
+        if self.reader is not None:
+          self.reader.discard_pending()
+          self.reader.overflowed.clear()
+        if self.capture is None or self.capture.process.poll() is not None:
+          raise CaptionError("capture-stopped", "The owned audio capture is no longer running.")
         self.paused = False
         self.transition_epoch += 1
-      self.writer.emit(self._status("listening"))
-      return {"ok": True, "state": "listening"}
+        self.writer.emit(self._status("listening"))
+        return {"ok": True, "state": "listening"}
     raise CaptionError("unknown-control", "Unknown caption control command.")
+
+  def _server_exit_error(self, loading: bool = False) -> CaptionError | None:
+    if self.server is None:
+      return None
+    return_code = self.server.process.poll()
+    if return_code is None:
+      return None
+    detail = self.server.stderr_drain.latest() if self.server.stderr_drain else ""
+    fallback = (
+      "Local whisper-server exited while loading the model."
+      if loading
+      else f"Local whisper-server exited with code {return_code}."
+    )
+    return CaptionError("server-exited", detail or fallback)
+
+  def _capture_exit_error(self) -> CaptionError:
+    assert self.capture is not None
+    return_code = self.capture.process.poll()
+    detail = self.capture.stderr_drain.latest() if self.capture.stderr_drain else ""
+    return CaptionError(
+      "capture-exited",
+      detail or f"Audio capture ended unexpectedly (code {return_code}).",
+    )
+
+  @staticmethod
+  def _backlog_error() -> CaptionError:
+    return CaptionError(
+      "capture-backlog",
+      "Captions fell behind live audio. Choose a smaller model or faster hardware, then restart captions.",
+    )
 
   def wait_until_ready(self, timeout: float = 90.0) -> None:
     assert self.server is not None
     deadline = time.monotonic() + max(2.0, min(timeout, 180.0))
     while not self.stop_event.is_set() and time.monotonic() < deadline:
-      if self.server.process.poll() is not None:
-        detail = self.server.stderr_drain.latest() if self.server.stderr_drain else ""
-        raise CaptionError("server-exited", detail or "Local whisper-server exited while loading the model.")
+      server_error = self._server_exit_error(loading=True)
+      if server_error is not None:
+        raise server_error
       if self.client.healthy():
         return
       self.stop_event.wait(0.2)
     if self.stop_event.is_set():
       raise CaptionError("stopped", "Caption startup was stopped.")
     raise CaptionError("server-timeout", "Local whisper-server did not become healthy before the startup timeout.")
+
+  def wait_until_capture_ready(self, timeout: float = CAPTURE_START_TIMEOUT) -> None:
+    if self.reader is None or self.capture is None:
+      raise CaptionError("capture-start", "Owned capture reader was not started.")
+    deadline = time.monotonic() + max(0.05, min(timeout, 30.0))
+    while not self.stop_event.is_set() and time.monotonic() < deadline:
+      server_error = self._server_exit_error()
+      if server_error is not None:
+        raise server_error
+      if self.capture.process.poll() is not None:
+        raise self._capture_exit_error()
+      if self.reader.overflowed.is_set():
+        raise self._backlog_error()
+      remaining = max(0.0, deadline - time.monotonic())
+      try:
+        chunk = self.reader.queue.get(timeout=min(0.2, remaining))
+      except queue.Empty:
+        continue
+      if chunk is None:
+        raise self._capture_exit_error()
+      with self._state_lock:
+        if not self.paused and chunk.epoch == self.transition_epoch:
+          self._prefetched_audio.append(chunk)
+          return
+    if self.stop_event.is_set():
+      raise CaptionError("stopped", "Caption startup was stopped.")
+    raise CaptionError(
+      "capture-no-audio",
+      "PipeWire produced no audio data. Check the selected source and PipeWire connection, then try again.",
+    )
 
   def cleanup(self) -> None:
     with self._cleanup_lock:
@@ -1014,8 +1301,12 @@ class CaptionSession:
       self.request_stop()
       if self.capture is not None:
         self.capture.terminate()
+        if self.reader is not None:
+          self.reader.thread.join(timeout=1.0)
+        self.capture.close_streams()
       if self.server is not None:
         self.server.terminate()
+        self.server.close_streams()
       with contextlib.suppress(OSError):
         self.public_directory.rmdir()
 
@@ -1023,12 +1314,21 @@ class CaptionSession:
     """Latch cancellation and stop audio capture without waiting for inference."""
     self.stop_event.set()
     if self.capture is not None:
-      # SIGTERM remains pending for a stopped process until it continues.
-      # Send both without waiting so closing the overlay ends capture now.
+      # Do not wait for an in-flight local inference request before ending
+      # audio capture. cleanup() performs the bounded reap/escalation.
       self.capture.signal(signal.SIGTERM)
-      self.capture.signal(signal.SIGCONT)
       self.paused = False
     self.client.cancel()
+
+  def _next_captured_chunk(self, timeout: float) -> CapturedChunk | None:
+    # Pause clears the startup prefetch from the control thread. Keep the
+    # check and pop under the same lock so it cannot empty the deque between
+    # those two operations.
+    with self._state_lock:
+      if self._prefetched_audio:
+        return self._prefetched_audio.popleft()
+    assert self.reader is not None
+    return self.reader.queue.get(timeout=timeout)
 
   def run_caption_loop(self) -> int:
     if self.reader is None or self.capture is None:
@@ -1045,6 +1345,11 @@ class CaptionSession:
       if self.writer.broken.is_set():
         self.stop_event.set()
         break
+      server_error = self._server_exit_error()
+      if server_error is not None:
+        raise server_error
+      if self.reader.overflowed.is_set():
+        raise self._backlog_error()
       with self._state_lock:
         paused = self.paused
         epoch = self.transition_epoch
@@ -1058,24 +1363,20 @@ class CaptionSession:
           reached_eof = True
           break
         try:
-          self.reader.queue.get(timeout=0.2)
+          self._next_captured_chunk(timeout=0.2)
         except queue.Empty:
           pass
         continue
       now = time.monotonic()
       if now >= next_heartbeat:
-        self.writer.emit(
-          {
-            "type": "heartbeat",
-            "state": "paused" if self.paused else "listening",
-            "source": self.source,
-            "elapsedSeconds": max(0, int(now - self.started_at)),
-          }
-        )
+        self._emit_heartbeat(now)
         next_heartbeat = now + 1.0
       try:
-        chunk = self.reader.queue.get(timeout=0.2)
+        chunk = self._next_captured_chunk(timeout=0.2)
       except queue.Empty:
+        server_error = self._server_exit_error()
+        if server_error is not None:
+          raise server_error
         if self.capture.process.poll() is not None:
           reached_eof = True
           break
@@ -1084,21 +1385,39 @@ class CaptionSession:
         reached_eof = True
         break
       if self.reader.overflowed.is_set():
-        self.reader.overflowed.clear()
+        raise self._backlog_error()
+      with self._state_lock:
+        paused = self.paused
+        epoch = self.transition_epoch
+      if paused or chunk.epoch != epoch:
+        continue
+      if time.monotonic() - chunk.captured_at > MAX_CAPTURE_BACKLOG_SECONDS:
+        raise self._backlog_error()
+      if epoch != local_epoch:
+        local_epoch = epoch
         audio.clear()
         deduper = TranscriptDeduper()
-      audio.extend(chunk)
+      audio.extend(chunk.data)
+      now = time.monotonic()
       if now >= next_level:
-        self.writer.emit(
-          {
-            "type": "level",
-            "source": self.source,
-            "value": round(pcm_level(chunk), 4),
-          }
-        )
+        with self._state_lock:
+          if not self.paused and chunk.epoch == self.transition_epoch:
+            self.writer.emit(
+              {
+                "type": "level",
+                "source": self.source,
+                "value": round(pcm_level(chunk.data), 4),
+              }
+            )
         next_level = now + 0.25
 
       while len(audio) >= WINDOW_BYTES and not self.stop_event.is_set():
+        with self._state_lock:
+          if self.paused or self.transition_epoch != local_epoch:
+            audio.clear()
+            deduper = TranscriptDeduper()
+            local_epoch = self.transition_epoch
+            break
         window_pcm = bytes(audio[:WINDOW_BYTES])
         del audio[: WINDOW_BYTES - OVERLAP_BYTES]
         inference_epoch = local_epoch
@@ -1113,6 +1432,8 @@ class CaptionSession:
             break
           raise
         inference_ms = max(0, int((time.monotonic() - inference_started) * 1000))
+        if self.reader.overflowed.is_set():
+          raise self._backlog_error()
         with self._state_lock:
           if self.paused or self.transition_epoch != inference_epoch:
             audio.clear()
@@ -1120,44 +1441,45 @@ class CaptionSession:
             local_epoch = self.transition_epoch
             sequence += 1
             continue
-        text = deduper.novel_text(raw_text)
-        end_ms = sequence * (WINDOW_SECONDS - OVERLAP_SECONDS) * 1000 + WINDOW_SECONDS * 1000
-        if text:
-          self.writer.emit(
-            {
-              "type": "caption",
-              "kind": "final",
-              "seq": sequence,
-              "startMs": max(0, end_ms - WINDOW_SECONDS * 1000),
-              "endMs": end_ms,
-              "text": text,
-              "source": self.source,
-              "latencyMs": WINDOW_SECONDS * 1000 + inference_ms,
-            }
-          )
+          text = deduper.novel_text(raw_text)
+          end_ms = sequence * (WINDOW_SECONDS - OVERLAP_SECONDS) * 1000 + WINDOW_SECONDS * 1000
+          if text:
+            # Holding the state lock through the write gives pause a strict
+            # event boundary: no caption can follow a published paused state.
+            self.writer.emit(
+              {
+                "type": "caption",
+                "kind": "final",
+                "seq": sequence,
+                "startMs": max(0, end_ms - WINDOW_SECONDS * 1000),
+                "endMs": end_ms,
+                "text": text,
+                "source": self.source,
+                "latencyMs": WINDOW_SECONDS * 1000 + inference_ms,
+              }
+            )
         sequence += 1
 
     if self.stop_event.is_set():
       return 0
     if reached_eof:
-      return_code = self.capture.process.poll()
-      if return_code not in (None, 0):
-        detail = self.capture.stderr_drain.latest() if self.capture.stderr_drain else ""
-        raise CaptionError("capture-exited", detail or f"Audio capture exited with code {return_code}.")
-      self.writer.emit(self._status("idle"))
-      return 0
+      # Only an explicit stop is a clean end to a real capture. PipeWire can
+      # exit zero on device removal; presenting that as Ready would hide the
+      # failure from the user.
+      raise self._capture_exit_error()
     return 0
 
 
 DEMO_CAPTIONS = (
-  ("microphone", "Live captions stay visible without blocking the app beneath."),
-  ("desktop", "Choose microphone or desktop audio for each private local session."),
-  ("desktop", "Rolling overlap keeps words at window boundaries from disappearing."),
-  ("microphone", "No audio recording or transcript file is retained."),
+  "Live captions stay visible without blocking the app beneath.",
+  "Choose microphone or desktop audio for each private local session.",
+  "Rolling overlap keeps words at window boundaries from disappearing.",
+  "No audio recording or transcript file is retained.",
 )
 
 
-def run_demo(writer: EventWriter, interval: float = 0.65) -> int:
+def run_demo(writer: EventWriter, interval: float = 0.65, source: str = "microphone") -> int:
+  source = validate_source(source)
   stopped = threading.Event()
 
   def handle_signal(_number: int, _frame: Any) -> None:
@@ -1170,13 +1492,13 @@ def run_demo(writer: EventWriter, interval: float = 0.65) -> int:
       signal.signal(number, handle_signal)
   started = time.monotonic()
   try:
-    writer.emit({"type": "status", "state": "starting", "source": "microphone", "elapsedSeconds": 0})
+    writer.emit({"type": "status", "state": "starting", "source": source, "elapsedSeconds": 0})
     if writer.broken.is_set():
       return 1
     if stopped.wait(max(0.0, interval / 2)):
       return 0
-    writer.emit({"type": "status", "state": "listening", "source": "microphone", "elapsedSeconds": 0})
-    for sequence, (source, text) in enumerate(DEMO_CAPTIONS):
+    writer.emit({"type": "status", "state": "listening", "source": source, "elapsedSeconds": 0})
+    for sequence, text in enumerate(DEMO_CAPTIONS):
       if writer.broken.is_set():
         break
       if stopped.wait(max(0.0, interval)):
@@ -1205,6 +1527,15 @@ def run_demo(writer: EventWriter, interval: float = 0.65) -> int:
       )
     return 0
   finally:
+    if not writer.broken.is_set():
+      writer.emit(
+        {
+          "type": "status",
+          "state": "idle",
+          "source": source,
+          "elapsedSeconds": max(0, int(time.monotonic() - started)),
+        }
+      )
     if threading.current_thread() is threading.main_thread():
       for number, handler in previous.items():
         signal.signal(number, handler)
@@ -1219,15 +1550,24 @@ def run_watch_session(
   server_binary: str | None = None,
   capture_binary: str | None = None,
   startup_timeout: float = 90.0,
+  capture_timeout: float = CAPTURE_START_TIMEOUT,
 ) -> int:
   if not platform_supported():
     raise CaptionError("unsupported-platform", "Real audio capture requires Linux with PipeWire.")
+  setpriv_command = executable("setpriv")
   server_command = executable("whisper-server") if server_binary is None else server_binary
   recorder_command = executable("pw-record") if capture_binary is None else capture_binary
   lease = SessionLease(runtime_dir())
   lease.acquire()
   try:
-    session = CaptionSession(model, source, language, writer, lease.directory)
+    session = CaptionSession(
+      model,
+      source,
+      language,
+      writer,
+      lease.directory,
+      setpriv_binary=setpriv_command,
+    )
   except BaseException:
     lease.close()
     raise
@@ -1253,6 +1593,7 @@ def run_watch_session(
     # Audio capture starts only after the local model reports healthy, so
     # startup never queues stale pre-ready speech.
     session.start_capture(recorder_command)
+    session.wait_until_capture_ready(capture_timeout)
     writer.emit(session._status("listening"))
     return session.run_caption_loop()
   except CaptionError as error:
@@ -1269,11 +1610,15 @@ def run_watch_session(
     sys.stderr.flush()
     return 1
   finally:
-    session.cleanup()
-    lease.close()
-    if threading.current_thread() is threading.main_thread():
-      for number, handler in previous.items():
-        signal.signal(number, handler)
+    try:
+      session.cleanup()
+    finally:
+      try:
+        lease.close()
+      finally:
+        if threading.current_thread() is threading.main_thread():
+          for number, handler in previous.items():
+            signal.signal(number, handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1328,13 +1673,17 @@ def main(argv: Sequence[str] | None = None) -> int:
       )
       return 0
     if args.command == "watch":
+      # Arm the foreground helper before model discovery or any other setup.
+      # If Quickshell disappears during startup, the helper must not survive
+      # long enough to open audio as an orphan.
+      arm_parent_death_signal()
       writer = EventWriter()
       if args.demo:
-        return run_demo(writer)
+        return run_demo(writer, source=args.source or "microphone")
       config = load_config()
       source = validate_source(args.source or config.get("source"))
       language = resolved_language(args.language, config)
-      model, _origin, issue = discover_model(args.model, config=config)
+      model, _origin, issue = discover_model(args.model, config=config, language=language)
       if model is None:
         writer.emit({"type": "error", "code": "model-missing", "message": issue})
         return 1

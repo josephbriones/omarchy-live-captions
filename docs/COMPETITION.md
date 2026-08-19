@@ -28,10 +28,12 @@ The local engine can improve without replacing the shell experience. Lower-laten
 3. Move the captions, resize the text, and change the number of visible lines.
 4. Start a short rights-cleared microphone sample and show the visible capture state.
 5. Stop, switch to desktop audio, and caption a local clip.
-6. Show that no audio file, transcript, history, or background service remains.
+6. Stop or Close and show that no capture/inference child, audio file, transcript, or history remains; only the idle resident QML owner stays loaded.
 
 ## The deliberate boundary
 
-Version 0.1 produces stable captions after a four-second window plus local inference. It is not sub-second broadcast captioning. It handles one source at a time, does not identify speakers, and does not install software or download a model.
+Version 0.2 produces stable captions after a four-second window plus local inference. The displayed value is an estimate of that window plus inference, not an observed end-to-caption measurement. It is not sub-second broadcast captioning. It handles one source at a time, does not identify speakers, and does not install software or download a model.
 
-Those are product choices, not footnotes. They make capture obvious, keep echo out of the first release, and leave the user's machine under the user's control.
+The resident QML owner never opens audio by itself. Start is explicit; during Pause, `pw-record` remains running and linked while new PCM is drained and discarded. The current prepared/requested window may finish locally with its result suppressed, and no later window starts until Resume. Stop or Close ends capture. If inference falls more than one three-second stride behind live audio, the session fails instead of showing stale captions.
+
+Those are product choices, not footnotes. They make capture obvious, keep echo out of each session, and leave the user's machine under the user's control.

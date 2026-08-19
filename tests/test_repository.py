@@ -13,11 +13,12 @@ class ManifestTests(unittest.TestCase):
   def setUp(self) -> None:
     self.manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
 
-  def test_manifest_is_one_namespaced_on_demand_overlay(self) -> None:
+  def test_manifest_is_one_namespaced_resident_overlay(self) -> None:
     self.assertEqual(self.manifest["schemaVersion"], 1)
     self.assertEqual(self.manifest["id"], "io.github.josephbriones.live-captions")
+    self.assertEqual(self.manifest["version"], "0.2.0")
     self.assertEqual(self.manifest["kinds"], ["overlay"])
-    self.assertNotIn("keepLoaded", self.manifest)
+    self.assertIs(self.manifest["keepLoaded"], True)
     self.assertEqual(self.manifest["entryPoints"], {"overlay": "LiveCaptions.qml"})
 
   def test_manifest_entry_points_are_safe_existing_relative_paths(self) -> None:
@@ -58,6 +59,7 @@ class QmlSafetyTests(unittest.TestCase):
   def test_close_stops_the_owned_qml_process_directly(self) -> None:
     close_body = self.qml[self.qml.index("function close()") : self.qml.index("function dismiss()")]
     self.assertIn("watchProcess.running = false", close_body)
+    self.assertIn("segments = []", close_body)
     self.assertNotIn("Quickshell.execDetached", close_body)
 
   def test_watcher_uses_quickshell_stdin_for_controls(self) -> None:
@@ -97,7 +99,7 @@ class QmlSafetyTests(unittest.TestCase):
       "function ping(): string",
     ):
       self.assertIn(signature, self.qml)
-    self.assertIn('if (root.demoMode) return "demo-running"', self.qml)
+    self.assertIn('if (root.demoMode) return watchProcess.running ? "demo-running" : "demo-finished"', self.qml)
     self.assertGreaterEqual(self.qml.count('if (root.demoMode) return "demo-read-only"'), 3)
 
   def test_doctor_output_finishes_before_it_can_mark_ready(self) -> None:
@@ -106,6 +108,43 @@ class QmlSafetyTests(unittest.TestCase):
     self.assertIn("CaptionModel.parseCommandResult(text)", doctor)
     exit_handler = doctor[doctor.index("onExited: function(exitCode)") :]
     self.assertNotIn("doctorStdout.text", exit_handler)
+
+  def test_process_start_failures_have_qml_fallbacks(self) -> None:
+    doctor = self.qml[self.qml.index("Process {\n    id: doctorProcess") : self.qml.index("Process {\n    id: watchProcess")]
+    watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
+    for block in (doctor, watcher):
+      self.assertIn("onStarted:", block)
+      self.assertIn("onRunningChanged:", block)
+      self.assertIn("Could not start the local caption helper", block)
+
+  def test_closed_or_stopping_sessions_reject_stale_events(self) -> None:
+    apply_event = self.qml[self.qml.index("function applyEvent(event)") : self.qml.index("Process {\n    id: doctorProcess")]
+    self.assertIn("if (!opened || explicitStop || !event || !event.valid) return", apply_event)
+    self.assertIn("reopenPending", self.qml)
+    self.assertIn("resumePendingOpen", self.qml)
+
+  def test_doctor_source_only_overrides_the_payload_default(self) -> None:
+    self.assertIn("sourceExplicit = options.sourceExplicit", self.qml)
+    apply_doctor = self.qml[self.qml.index("function applyDoctor(event)") : self.qml.index("function applyEvent(event)")]
+    self.assertIn('if (!sourceExplicit && event.source && event.source !== "unknown")', apply_doctor)
+
+  def test_demo_is_single_source_and_settles_idle(self) -> None:
+    self.assertIn('? [root.backendPath, "watch", "--demo", "--source", root.activeSource]', self.qml)
+    self.assertIn("if (!demoMode && event.source", self.qml)
+    self.assertIn("source: activeSource", self.qml)
+    watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
+    self.assertRegex(watcher, r"if \(root\.demoMode\)[\s\S]*?else \{\s*root\.phase = \"idle\"")
+
+  def test_stop_privacy_and_ipc_follow_the_process(self) -> None:
+    self.assertIn('if (watchProcess.running) return sourceText + " session active', self.qml)
+    self.assertGreaterEqual(self.qml.count("visible: !root.demoMode && watchProcess.running"), 2)
+    stop = self.qml[self.qml.index("function stop(): string") : self.qml.index("function state(): string")]
+    self.assertIn('if (!watchProcess.running) return "not-recording"', stop)
+    self.assertIn("running: watchProcess.running", self.qml)
+
+  def test_setup_failure_offers_a_demo(self) -> None:
+    self.assertIn('text: "Try demo"', self.qml)
+    self.assertIn("onClicked: root.open(JSON.stringify({", self.qml)
 
   def test_no_shell_interpreter_is_used_by_qml(self) -> None:
     self.assertNotRegex(self.qml, re.compile(r"\b(?:bash|sh|zsh)\b\s*,"))

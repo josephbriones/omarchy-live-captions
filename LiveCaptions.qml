@@ -33,12 +33,19 @@ Item {
   property bool doctorReady: false
   property string doctorMessage: ""
   property var doctorMissing: []
+  property var doctorIssues: []
 
   property real fontScale: 1
   property int maxRows: 3
   property string captionPosition: "bottom"
   property bool controlsExpanded: true
   property bool explicitStop: false
+  property bool sourceExplicit: false
+  property bool doctorStartPending: false
+  property bool doctorExpectedStop: false
+  property bool watchStartPending: false
+  property bool reopenPending: false
+  property string reopenPayload: ""
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id)
@@ -46,7 +53,7 @@ Item {
   readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
   readonly property string backendPath: sourceDir + "/bin/live-captions"
   readonly property bool activeState: ["starting", "listening", "recording", "paused", "stopping"].indexOf(phase) !== -1
-  readonly property bool captionSurfaceVisible: opened && (demoMode || activeState)
+  readonly property bool captionSurfaceVisible: opened && (demoMode || watchProcess.running || activeState)
   readonly property var visibleSegments: CaptionModel.visibleRows(segments, maxRows)
   readonly property string statusText: CaptionModel.statusLabel(phase, demoMode)
   readonly property string sourceText: activeSource === "desktop" ? "Desktop audio" : "Microphone"
@@ -58,12 +65,15 @@ Item {
   }
   readonly property string privacyText: {
     if (demoMode) return "Synthetic demo · no audio device is opened"
-    if (activeState) return sourceText + " · on-device · no transcript file"
+    if (watchProcess.running) return sourceText + " session active · on-device · no transcript file"
+    if (watchStartPending) return "Starting local captions…"
     return "Nothing is recording. Capture requires an explicit Start action."
   }
   readonly property string setupDetails: {
     var parts = []
     if (doctorMessage) parts.push(doctorMessage)
+    if (doctorIssues && doctorIssues.length > 0)
+      parts.push(doctorIssues.join("\n"))
     if (doctorMissing && doctorMissing.length > 0)
       parts.push("Missing: " + doctorMissing.join(", "))
     if (parts.length === 0)
@@ -85,15 +95,27 @@ Item {
 
   function open(payloadJson) {
     var options = CaptionModel.parsePayload(payloadJson)
-    if (opened && (watchProcess.running || activeState)) {
+    if (opened && (doctorProcess.running || watchProcess.running || activeState)) {
       // A second summon reveals controls, but it must never swap an audio
       // source or turn a real capture into a demo mid-session.
       controlsExpanded = true
       return
     }
+    if (!opened && (doctorProcess.running || watchProcess.running || doctorExpectedStop || explicitStop)) {
+      // close() is asynchronous at the process boundary. Keep the requested
+      // payload until the old child has actually left, so its final output
+      // cannot leak into the next session.
+      reopenPending = true
+      reopenPayload = typeof payloadJson === "string" ? payloadJson : ""
+      opened = true
+      controlsExpanded = true
+      phase = watchProcess.running ? "stopping" : "checking"
+      return
+    }
     demoMode = options.demo
     selectedSource = options.source
     activeSource = options.source
+    sourceExplicit = options.sourceExplicit
     fontScale = options.fontScale
     maxRows = options.maxRows
     captionPosition = options.position
@@ -108,28 +130,61 @@ Item {
     doctorReady = demoMode
     doctorMessage = ""
     doctorMissing = []
+    doctorIssues = []
     explicitStop = false
     phase = demoMode ? "starting" : "checking"
     opened = true
 
     if (demoMode) {
       Qt.callLater(function() {
-        if (root.opened && root.demoMode) watchProcess.running = true
+        if (root.opened && root.demoMode) {
+          root.watchStartPending = true
+          watchProcess.running = true
+        }
       })
     } else {
       Qt.callLater(function() {
-        if (root.opened && !root.demoMode) doctorProcess.running = true
+        if (root.opened && !root.demoMode) {
+          root.doctorExpectedStop = false
+          root.doctorStartPending = true
+          doctorProcess.running = true
+        }
       })
     }
   }
 
   function close() {
     opened = false
-    doctorProcess.running = false
+    reopenPending = false
+    reopenPayload = ""
+    segments = []
+    inputLevel = 0
+    watchStartPending = false
+    doctorStartPending = false
+    if (doctorProcess.running) {
+      doctorExpectedStop = true
+      doctorProcess.running = false
+    }
     if (watchProcess.running) {
       explicitStop = true
+      phase = "stopping"
       watchProcess.running = false
+    } else {
+      explicitStop = false
+      phase = "idle"
     }
+  }
+
+  function resumePendingOpen() {
+    if (!reopenPending || !opened || doctorProcess.running || watchProcess.running
+        || doctorExpectedStop || explicitStop) return
+    var payload = reopenPayload
+    reopenPending = false
+    reopenPayload = ""
+    phase = "idle"
+    Qt.callLater(function() {
+      if (root.opened) root.open(payload)
+    })
   }
 
   function dismiss() {
@@ -143,6 +198,8 @@ Item {
     doctorReady = false
     errorMessage = ""
     phase = "checking"
+    doctorExpectedStop = false
+    doctorStartPending = true
     doctorProcess.running = true
   }
 
@@ -158,6 +215,7 @@ Item {
     lastDiagnostic = ""
     explicitStop = false
     phase = "starting"
+    watchStartPending = true
     watchProcess.running = true
   }
 
@@ -176,30 +234,45 @@ Item {
   }
 
   function applyDoctor(event) {
-    if (!event || !event.valid) return
+    if (!opened || demoMode || doctorExpectedStop || !event || !event.valid) return
     doctorSeen = true
     doctorReady = event.ready === true
     doctorMessage = event.message || ""
-    doctorMissing = event.missing || event.issues || []
+    doctorMissing = event.missing || []
+    doctorIssues = event.issues || []
+    if (!sourceExplicit && event.source && event.source !== "unknown") {
+      selectedSource = event.source
+      activeSource = event.source
+    }
     phase = doctorReady ? "idle" : "setup"
     errorMessage = doctorReady ? "" : doctorMessage
   }
 
   function applyEvent(event) {
-    if (!event || !event.valid) return
+    if (!opened || explicitStop || !event || !event.valid) return
     if (event.type === "doctor") {
       applyDoctor(event)
       return
     }
     if (event.type === "status") {
       phase = event.state
-      if (event.source && event.source !== "unknown") activeSource = event.source
+      if (!demoMode && event.source && event.source !== "unknown") activeSource = event.source
       elapsedSeconds = Math.max(elapsedSeconds, event.elapsedSeconds || 0)
       if (phase !== "error") errorMessage = ""
       return
     }
     if (event.type === "caption") {
-      segments = CaptionModel.appendSegment(segments, event.segment, CaptionModel.MAX_SEGMENTS)
+      var segment = event.segment
+      if (demoMode) {
+        segment = {
+          id: event.segment.id,
+          startMs: event.segment.startMs,
+          endMs: event.segment.endMs,
+          text: event.segment.text,
+          source: activeSource
+        }
+      }
+      segments = CaptionModel.appendSegment(segments, segment, CaptionModel.MAX_SEGMENTS)
       lastLatencyMs = event.latencyMs || 0
       if (phase !== "paused") phase = "recording"
       return
@@ -226,7 +299,7 @@ Item {
       id: doctorStdout
       waitForEnd: true
       onStreamFinished: {
-        if (!root.opened || root.demoMode) return
+        if (!root.opened || root.demoMode || root.doctorExpectedStop) return
         var result = CaptionModel.parseCommandResult(text)
         var data = result.valid ? result.data : {
           ok: false,
@@ -242,7 +315,35 @@ Item {
       id: doctorStderr
       waitForEnd: true
     }
+    onStarted: root.doctorStartPending = false
+    onRunningChanged: {
+      if (running) return
+      if (root.doctorExpectedStop) {
+        root.doctorStartPending = false
+        root.doctorExpectedStop = false
+        Qt.callLater(function() { root.resumePendingOpen() })
+        return
+      }
+      if (!root.doctorStartPending) return
+      root.doctorStartPending = false
+      if (root.opened && !root.demoMode && !root.doctorExpectedStop) {
+        root.applyDoctor({
+          valid: true,
+          type: "doctor",
+          ready: false,
+          message: "Could not start the local caption helper. Check that bin/live-captions is installed and executable.",
+          missing: []
+        })
+      }
+      Qt.callLater(function() { root.resumePendingOpen() })
+    }
     onExited: function(exitCode) {
+      root.doctorStartPending = false
+      if (root.doctorExpectedStop) {
+        root.doctorExpectedStop = false
+        Qt.callLater(function() { root.resumePendingOpen() })
+        return
+      }
       if (!root.opened || root.demoMode || root.doctorSeen) return
       root.applyDoctor({
         valid: true,
@@ -258,28 +359,54 @@ Item {
     id: watchProcess
     stdinEnabled: true
     command: root.demoMode
-      ? [root.backendPath, "watch", "--demo"]
+      ? [root.backendPath, "watch", "--demo", "--source", root.activeSource]
       : [root.backendPath, "watch", "--source", root.activeSource]
     stdout: SplitParser {
       onRead: function(line) { root.applyEvent(CaptionModel.parseEvent(line)) }
     }
     stderr: SplitParser {
-      onRead: function(line) { root.lastDiagnostic = CaptionModel.cleanText(line, 500) }
+      onRead: function(line) {
+        if (root.opened && !root.explicitStop)
+          root.lastDiagnostic = CaptionModel.cleanText(line, 500)
+      }
+    }
+    onStarted: root.watchStartPending = false
+    onRunningChanged: {
+      if (running) return
+      if (root.explicitStop) {
+        root.watchStartPending = false
+        root.explicitStop = false
+        root.phase = "idle"
+        root.elapsedSeconds = 0
+        Qt.callLater(function() { root.resumePendingOpen() })
+        return
+      }
+      if (!root.watchStartPending) return
+      root.watchStartPending = false
+      if (root.opened && !root.explicitStop) {
+        root.errorMessage = "Could not start the local caption helper. Check that bin/live-captions is installed and executable."
+        root.phase = "error"
+      }
+      Qt.callLater(function() { root.resumePendingOpen() })
     }
     onExited: function(exitCode) {
+      root.watchStartPending = false
       root.inputLevel = 0
+      if (root.explicitStop) {
+        root.explicitStop = false
+        root.phase = "idle"
+        root.elapsedSeconds = 0
+        Qt.callLater(function() { root.resumePendingOpen() })
+        return
+      }
       if (!root.opened) return
       if (root.demoMode) {
         if (exitCode !== 0) {
           root.errorMessage = root.lastDiagnostic || "The caption demo stopped unexpectedly."
           root.phase = "error"
+        } else {
+          root.phase = "idle"
         }
-        return
-      }
-      if (root.explicitStop) {
-        root.explicitStop = false
-        root.phase = "idle"
-        root.elapsedSeconds = 0
         return
       }
       if (["starting", "listening", "recording", "paused"].indexOf(root.phase) !== -1) {
@@ -302,26 +429,29 @@ Item {
     }
     function start(): string {
       if (!root.opened) return "closed"
-      if (root.demoMode) return "demo-running"
+      if (root.demoMode) return watchProcess.running ? "demo-running" : "demo-finished"
       if (!root.doctorReady) return "not-ready"
+      if (watchProcess.running) return "already-running"
       root.beginCaptions()
       return "ok"
     }
     function pause(): string {
       if (root.demoMode) return "demo-read-only"
+      if (!watchProcess.running) return "not-recording"
       if (root.phase !== "listening" && root.phase !== "recording") return "not-recording"
       root.runAction("pause")
       return "ok"
     }
     function resume(): string {
       if (root.demoMode) return "demo-read-only"
+      if (!watchProcess.running) return "not-paused"
       if (root.phase !== "paused") return "not-paused"
       root.runAction("resume")
       return "ok"
     }
     function stop(): string {
       if (root.demoMode) return "demo-read-only"
-      if (!root.activeState) return "not-recording"
+      if (!watchProcess.running) return "not-recording"
       root.runAction("stop")
       return "ok"
     }
@@ -331,6 +461,7 @@ Item {
         state: root.phase,
         source: root.activeSource,
         demo: root.demoMode,
+        running: watchProcess.running,
         ready: root.doctorReady,
         segmentCount: root.segments.length
       })
@@ -572,19 +703,38 @@ Item {
             }
             Text {
               width: parent.width
-              text: "The helper also discovers compatible models already downloaded by VoxType. Reopen this card after installing dependencies."
+              text: "The helper also discovers compatible models already downloaded by VoxType. Choose Check again after installing dependencies."
               color: Util.alpha(Color.popups.text, 0.64)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
-            Button {
-              text: root.doctorSeen ? "Check again" : "Checking…"
-              iconText: "↻"
-              enabled: root.doctorSeen && !doctorProcess.running
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.retryDoctor()
+            Row {
+              spacing: Style.space(8)
+
+              Button {
+                text: root.doctorSeen ? "Check again" : "Checking…"
+                iconText: "↻"
+                enabled: root.doctorSeen && !doctorProcess.running
+                foreground: Color.popups.text
+                bordered: true
+                onClicked: root.retryDoctor()
+              }
+              Button {
+                text: "Try demo"
+                iconText: "▶"
+                enabled: !doctorProcess.running && !watchProcess.running
+                foreground: Color.popups.text
+                accent: Color.accent
+                bordered: true
+                onClicked: root.open(JSON.stringify({
+                  demo: true,
+                  source: root.selectedSource,
+                  fontScale: root.fontScale,
+                  maxRows: root.maxRows,
+                  position: root.captionPosition
+                }))
+              }
             }
           }
 
@@ -666,7 +816,7 @@ Item {
                 onClicked: root.runAction("resume")
               }
               Button {
-                visible: !root.demoMode && root.activeState
+                visible: !root.demoMode && watchProcess.running
                 text: root.phase === "stopping" ? "Stopping…" : "Stop"
                 iconText: "■"
                 enabled: watchProcess.running && root.phase !== "stopping"
@@ -687,7 +837,7 @@ Item {
             }
 
             Rectangle {
-              visible: !root.demoMode && root.activeState
+              visible: !root.demoMode && watchProcess.running
               width: parent.width
               height: Style.space(4)
               radius: height / 2
