@@ -4,9 +4,9 @@ Live Captions is designed for local processing, visible capture state, and no tr
 
 ## Data flow
 
-Nothing captures audio merely because the overlay opened. An explicit Start action first loads a local `whisper-server`; only after its health check passes does the helper launch `pw-record` for the selected source—microphone or desktop monitor. Rolling in-memory audio windows are sent to that local inference process. Normalized caption events travel over the helper's standard output to Quickshell.
+Nothing captures audio merely because the overlay opened. The manifest keeps the lightweight QML owner resident after Close so it can finish cleanup, but that owner does not open audio. An explicit Start action first loads a local `whisper-server`; only after its health check passes does the helper launch `pw-record` for the selected source—microphone or desktop monitor. The UI reports Listening only after the first PCM bytes arrive. Rolling in-memory audio windows are sent to that local inference process. Normalized caption events travel over the helper's standard output to Quickshell.
 
-The plugin has no analytics, account, telemetry, advertising, cloud API, or external network request. The inference server is hard-bound to `127.0.0.1`, and each run uses an unguessable request-path token plus an empty private web directory. Loopback communication does not leave the machine.
+The plugin has no analytics, account, telemetry, advertising, cloud API, or external network request. The inference server is hard-bound to `127.0.0.1`, and each run uses a random 128-bit request path plus an empty private web directory. Loopback communication does not leave the machine. The random path prevents accidental cross-talk; it is not authentication against another process running as the same user, which can inspect process arguments. This plugin, Quickshell, PipeWire clients, and other same-user desktop processes share the local-user trust boundary.
 
 ## Retention
 
@@ -14,7 +14,9 @@ The plugin has no analytics, account, telemetry, advertising, cloud API, or exte
 - Transcript text is not written to a history, database, or export file.
 - The UI keeps only a bounded recent-caption list in memory.
 - Short rolling PCM/WAV windows exist only in helper memory and are discarded after inference.
-- Plugin preferences contain settings such as model path and source, never captions.
+- Plugin preferences contain model path, source, and language settings, never captions.
+
+Pause leaves the owned recorder running and its PipeWire stream linked. The helper drains and discards new PCM and emits no caption. The one window already being prepared or requested may finish locally after Pause; its result is suppressed, and no later window starts until Resume. Resume starts with fresh audio. **Stop** or **Close** terminates the owned capture and inference processes and is the privacy boundary to use when capture must end.
 
 A mode-`0600` single-session lock may live below the private user runtime directory, never the persistent data directory. It contains no caption text or audio. Runtime cleanup is best effort after an abrupt power loss or process kill.
 

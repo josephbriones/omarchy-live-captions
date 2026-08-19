@@ -19,6 +19,7 @@ test("parsePayload defaults safely and ignores autostart", () => {
   assert.deepEqual(model.parsePayload("not json"), {
     demo: false,
     source: "microphone",
+    sourceExplicit: false,
     fontScale: 1,
     maxRows: 3,
     position: "bottom"
@@ -26,6 +27,7 @@ test("parsePayload defaults safely and ignores autostart", () => {
   const payload = model.parsePayload('{"demo":true,"autostart":true,"source":"desktop","fontScale":99,"maxRows":0,"position":"TOP"}')
   assert.equal(payload.demo, true)
   assert.equal(payload.source, "desktop")
+  assert.equal(payload.sourceExplicit, true)
   assert.equal(payload.fontScale, 1.8)
   assert.equal(payload.maxRows, 1)
   assert.equal(payload.position, "top")
@@ -41,7 +43,7 @@ test("text normalization strips controls, folds whitespace, and bounds size", ()
 test("source values stay inside the backend protocol", () => {
   assert.equal(model.sourceKey("microphone"), "microphone")
   assert.equal(model.sourceKey("desktop"), "desktop")
-  assert.equal(model.sourceLabel("microphone"), "You")
+  assert.equal(model.sourceLabel("microphone"), "Microphone")
   assert.equal(model.sourceLabel("desktop"), "Desktop audio")
   assert.equal(model.sourceKey("system"), "unknown")
   assert.equal(model.sourceLabel(undefined), "Speaker")
@@ -50,8 +52,8 @@ test("source values stay inside the backend protocol", () => {
 test("segments normalize the exact caption shape and discard empty text", () => {
   const segment = model.normalizeSegment({
     seq: 7,
-    startMs: -10,
-    endMs: -5,
+    startMs: 0,
+    endMs: 0,
     text: "  A caption  ",
     source: "desktop"
   }, 1)
@@ -65,6 +67,9 @@ test("segments normalize the exact caption shape and discard empty text", () => 
   })
   assert.equal(model.normalizeSegment({ text: " \n " }, 2), null)
   assert.equal(model.normalizeSegment("caption", 3), null)
+  assert.equal(model.normalizeSegment({ text: ["caption"] }, 3), null)
+  assert.equal(model.normalizeSegment({ text: "caption", startMs: "1" }, 3), null)
+  assert.equal(model.normalizeSegment({ text: "caption", startMs: -1 }, 3), null)
 })
 
 test("segment lists are bounded and visibleRows selects the tail", () => {
@@ -91,14 +96,18 @@ test("doctor and status events normalize the backend contract", () => {
     ready: true,
     ok: true,
     message: "Dependencies found.",
-    missing: ["pw-record", "", "extra"]
+    source: "desktop",
+    missing: ["pw-record", "", "extra"],
+    issues: ["Install the current whisper-cpp package.", ""]
   })
   assert.equal(doctor.valid, true)
   assert.equal(doctor.ready, true)
   assert.equal(doctor.message, "Dependencies found.")
+  assert.equal(doctor.source, "desktop")
   assert.deepEqual(doctor.missing, ["pw-record", "extra"])
+  assert.deepEqual(doctor.issues, ["Install the current whisper-cpp package."])
 
-  const status = model.parseEvent('{"type":"status","state":"stopping","source":"desktop","elapsedSeconds":4.9}')
+  const status = model.parseEvent('{"type":"status","state":"stopping","source":"desktop","elapsedSeconds":4}')
   assert.equal(status.state, "stopping")
   assert.equal(status.source, "desktop")
   assert.equal(status.elapsedSeconds, 4)
@@ -124,9 +133,9 @@ test("caption events produce one normalized segment and reject blanks", () => {
 })
 
 test("level, heartbeat, and error events are bounded", () => {
-  const level = model.parseEvent({ type: "level", source: "microphone", value: 7 })
+  const level = model.parseEvent({ type: "level", source: "microphone", value: 0.7 })
   assert.equal(level.source, "microphone")
-  assert.equal(level.value, 1)
+  assert.equal(level.value, 0.7)
 
   const heartbeat = model.parseEvent({ type: "heartbeat", state: "recording", source: "desktop", elapsedSeconds: 5 })
   assert.equal(heartbeat.state, "recording")
@@ -142,6 +151,18 @@ test("unknown and malformed events cannot become valid state", () => {
   assert.deepEqual(model.parseEvent("{"), { valid: false, type: "invalid" })
   assert.deepEqual(model.parseEvent("[]"), { valid: false, type: "invalid" })
   assert.deepEqual(model.parseEvent('{"type":"surprise"}'), { valid: false, type: "surprise" })
+  assert.deepEqual(model.parseEvent({ type: "status", state: "mystery", source: "desktop", elapsedSeconds: 1 }), { valid: false, type: "status" })
+  assert.deepEqual(model.parseEvent({ type: "status", state: "recording", source: "desktop", elapsedSeconds: "1" }), { valid: false, type: "status" })
+  assert.deepEqual(model.parseEvent({ type: "level", source: "desktop", value: 7 }), { valid: false, type: "level" })
+  assert.deepEqual(model.parseEvent({ type: "heartbeat", state: "recording", source: "desktop", elapsedSeconds: Infinity }), { valid: false, type: "heartbeat" })
+  assert.deepEqual(model.parseEvent({ type: "doctor", ready: "yes", message: "ready" }), { valid: false, type: "doctor" })
+  assert.deepEqual(model.parseEvent({ type: "doctor", ready: false, message: { unsafe: true } }), { valid: false, type: "doctor" })
+  assert.deepEqual(model.parseEvent({ type: "doctor", ready: false, issues: "bad shape" }), { valid: false, type: "doctor" })
+  assert.deepEqual(model.parseEvent({ type: "error", code: 500, message: "failed" }), { valid: false, type: "error" })
+  assert.deepEqual(model.parseEvent({ type: "error", message: ["failed"] }), { valid: false, type: "error" })
+  assert.deepEqual(model.parseEvent({ type: "caption", kind: "final", seq: 1.5, latencyMs: 1, startMs: 0, endMs: 1, text: "caption", source: "desktop" }), { valid: false, type: "caption" })
+  assert.deepEqual(model.parseEvent({ type: "caption", seq: 1, latencyMs: 1, startMs: 0, endMs: 1, text: "caption", source: "desktop" }), { valid: false, type: "caption" })
+  assert.deepEqual(model.parseEvent({ type: "caption", kind: "final", seq: 1, latencyMs: 1, startMs: 0, endMs: 1, text: { unsafe: true }, source: "desktop" }), { valid: false, type: "caption" })
 })
 
 test("command results parse the helper's single JSON response", () => {
@@ -167,6 +188,8 @@ test("time and state labels stay deterministic", () => {
   assert.equal(model.formatElapsed(65.9), "01:05")
   assert.equal(model.formatElapsed(3661), "1:01:01")
   assert.equal(model.normalizeState("mystery"), "idle")
+  assert.equal(model.stateKey("paused"), "paused")
+  assert.equal(model.stateKey("mystery"), "")
   assert.equal(model.statusLabel("listening", false), "Listening")
   assert.equal(model.statusLabel("recording", true), "Demo")
 })

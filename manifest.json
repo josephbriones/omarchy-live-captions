@@ -2,10 +2,11 @@
   "schemaVersion": 1,
   "id": "io.github.josephbriones.live-captions",
   "name": "Live Captions",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "keepLoaded": true,
   "author": "Joseph Briones",
   "license": "MIT",
-  "description": "Local captions for microphone or desktop audio, with no recording or transcript saved.",
+  "description": "Explicit-start, on-device microphone or desktop captions; saves neither audio nor transcript.",
   "kinds": [
     "overlay"
   ],

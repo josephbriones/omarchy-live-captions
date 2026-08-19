@@ -4,6 +4,8 @@
 
 var MAX_SEGMENTS = 96
 var MAX_TEXT_LENGTH = 1200
+var MAX_PROTOCOL_INTEGER = 2147483647
+var VALID_STATES = ["idle", "checking", "setup", "starting", "listening", "recording", "paused", "stopping", "error"]
 
 function clamp(value, minimum, maximum) {
   var number = Number(value)
@@ -44,12 +46,14 @@ function parsePayload(raw) {
   var payload = parseJson(raw)
   var position = String(payload.position || "bottom").toLowerCase()
   if (position !== "top") position = "bottom"
+  var requestedSource = sourceKey(payload.source)
 
   return {
     // Demo mode is synthetic and safe to activate when opening. There is no
     // autostart option: real audio always needs an explicit Start action.
     demo: parseBoolean(payload.demo, false),
-    source: sourceKey(payload.source) === "desktop" ? "desktop" : "microphone",
+    source: requestedSource === "desktop" ? "desktop" : "microphone",
+    sourceExplicit: requestedSource !== "unknown",
     fontScale: clamp(payload.fontScale === undefined ? 1 : payload.fontScale, 0.8, 1.8),
     maxRows: Math.round(clamp(payload.maxRows === undefined ? 3 : payload.maxRows, 1, 5)),
     position: position
@@ -63,22 +67,31 @@ function sourceKey(value) {
 
 function sourceLabel(value) {
   var source = sourceKey(value)
-  if (source === "microphone") return "You"
+  if (source === "microphone") return "Microphone"
   if (source === "desktop") return "Desktop audio"
   return source === "unknown" ? "Speaker" : cleanText(source, 40)
 }
 
 function normalizeSegment(segment, fallbackIndex) {
   if (!plainObject(segment)) return null
+  if (typeof segment.text !== "string") return null
   var text = cleanText(segment.text, MAX_TEXT_LENGTH)
   if (text === "") return null
 
-  var startMs = Math.max(0, Number(segment.startMs) || 0)
-  var endMs = Math.max(startMs, Number(segment.endMs) || startMs)
+  var startMs = segment.startMs === undefined
+    ? 0
+    : protocolNumber(segment.startMs, 0, MAX_PROTOCOL_INTEGER, false)
+  var endMs = segment.endMs === undefined
+    ? startMs
+    : protocolNumber(segment.endMs, startMs === null ? 0 : startMs, MAX_PROTOCOL_INTEGER, false)
+  if (startMs === null || endMs === null) return null
   var source = sourceKey(segment.source)
+  var rawId = segment.id === undefined ? segment.seq : segment.id
+  if (rawId !== undefined && typeof rawId !== "string" && typeof rawId !== "number") return null
+  if (typeof rawId === "number" && (!isFinite(rawId) || rawId < 0 || rawId > MAX_PROTOCOL_INTEGER)) return null
 
   return {
-    id: cleanText(segment.id === undefined ? segment.seq : segment.id, 100)
+    id: cleanText(rawId, 100)
       || String(fallbackIndex === undefined ? 0 : fallbackIndex),
     startMs: startMs,
     endMs: endMs,
@@ -128,10 +141,20 @@ function speakerLabel(segment) {
 }
 
 function normalizeState(value) {
-  var state = String(value || "idle").toLowerCase()
-  if (["idle", "checking", "setup", "starting", "listening", "recording", "paused", "stopping", "error"].indexOf(state) === -1)
-    return "idle"
-  return state
+  return stateKey(value) || "idle"
+}
+
+function stateKey(value) {
+  if (typeof value !== "string") return ""
+  var state = value.toLowerCase()
+  return VALID_STATES.indexOf(state) === -1 ? "" : state
+}
+
+function protocolNumber(value, minimum, maximum, integer) {
+  if (typeof value !== "number" || !isFinite(value)) return null
+  if (integer && Math.floor(value) !== value) return null
+  if (value < minimum || value > maximum) return null
+  return value
 }
 
 function eventBase(type) {
@@ -148,63 +171,102 @@ function parseEvent(raw) {
   }
   if (!plainObject(data)) return { valid: false, type: "invalid" }
 
-  var type = String(data.type || "").toLowerCase()
+  if (typeof data.type !== "string") return { valid: false, type: "invalid" }
+  var type = data.type.toLowerCase()
   if (type === "doctor") {
+    if (typeof data.ready !== "boolean"
+        || (data.ok !== undefined && typeof data.ok !== "boolean")
+        || (data.message !== undefined && typeof data.message !== "string")
+        || (data.missing !== undefined && !Array.isArray(data.missing))
+        || (data.issues !== undefined && !Array.isArray(data.issues)))
+      return { valid: false, type: "doctor" }
     var doctor = eventBase("doctor")
     doctor.ready = parseBoolean(data.ready, false)
     doctor.ok = parseBoolean(data.ok, doctor.ready)
     doctor.message = cleanText(data.message, 400)
+    doctor.source = sourceKey(data.source)
     doctor.missing = Array.isArray(data.missing)
-      ? data.missing.slice(0, 8).map(function(item) { return cleanText(item, 100) }).filter(Boolean)
+      ? data.missing.slice(0, 8).filter(function(item) { return typeof item === "string" })
+          .map(function(item) { return cleanText(item, 100) }).filter(Boolean)
+      : []
+    doctor.issues = Array.isArray(data.issues)
+      ? data.issues.slice(0, 8).filter(function(item) { return typeof item === "string" })
+          .map(function(item) { return cleanText(item, 300) }).filter(Boolean)
       : []
     return doctor
   }
 
   if (type === "status") {
+    var statusState = stateKey(data.state)
+    var statusSource = sourceKey(data.source)
+    var statusElapsed = protocolNumber(data.elapsedSeconds, 0, MAX_PROTOCOL_INTEGER, true)
+    if (!statusState || statusSource === "unknown" || statusElapsed === null)
+      return { valid: false, type: "status" }
     var status = eventBase("status")
-    status.state = normalizeState(data.state)
-    status.source = sourceKey(data.source)
-    status.elapsedSeconds = Math.max(0, Math.floor(Number(data.elapsedSeconds) || 0))
+    status.state = statusState
+    status.source = statusSource
+    status.elapsedSeconds = statusElapsed
     return status
   }
 
 
   if (type === "caption") {
+    var captionSource = sourceKey(data.source)
+    var captionSequence = protocolNumber(data.seq, 0, MAX_PROTOCOL_INTEGER, true)
+    var captionLatency = protocolNumber(data.latencyMs, 0, MAX_PROTOCOL_INTEGER, true)
+    var captionStart = protocolNumber(data.startMs, 0, MAX_PROTOCOL_INTEGER, true)
+    var captionEnd = protocolNumber(data.endMs, 0, MAX_PROTOCOL_INTEGER, true)
+    if (typeof data.kind !== "string" || typeof data.text !== "string"
+        || captionSource === "unknown" || captionSequence === null
+        || captionLatency === null || captionStart === null || captionEnd === null || captionEnd < captionStart)
+      return { valid: false, type: "caption" }
     var caption = eventBase("caption")
-    caption.kind = cleanText(data.kind || "final", 20).toLowerCase()
-    caption.seq = Math.max(0, Math.floor(Number(data.seq) || 0))
-    caption.latencyMs = Math.max(0, Math.floor(Number(data.latencyMs) || 0))
+    caption.kind = cleanText(data.kind, 20).toLowerCase()
+    if (caption.kind !== "final") return { valid: false, type: "caption" }
+    caption.seq = captionSequence
+    caption.latencyMs = captionLatency
     caption.segment = normalizeSegment({
       id: data.id === undefined ? data.seq : data.id,
       seq: data.seq,
-      startMs: data.startMs,
-      endMs: data.endMs,
+      startMs: captionStart,
+      endMs: captionEnd,
       text: data.text,
-      source: data.source
+      source: captionSource
     }, caption.seq)
     if (!caption.segment) return { valid: false, type: "caption" }
     return caption
   }
 
   if (type === "level") {
+    var levelSource = sourceKey(data.source)
+    var levelValue = protocolNumber(data.value, 0, 1, false)
+    if (levelSource === "unknown" || levelValue === null) return { valid: false, type: "level" }
     var level = eventBase("level")
-    level.source = sourceKey(data.source)
-    level.value = clamp(data.value, 0, 1)
+    level.source = levelSource
+    level.value = levelValue
     return level
   }
 
   if (type === "error") {
+    if (typeof data.message !== "string"
+        || (data.code !== undefined && typeof data.code !== "string"))
+      return { valid: false, type: "error" }
     var failure = eventBase("error")
-    failure.code = cleanText(data.code, 80)
-    failure.message = cleanText(data.message || data.error || "Live captions encountered an error.", 500)
+    failure.code = typeof data.code === "string" ? cleanText(data.code, 80) : ""
+    failure.message = cleanText(data.message, 500) || "Live captions encountered an error."
     return failure
   }
 
   if (type === "heartbeat") {
+    var heartbeatState = stateKey(data.state)
+    var heartbeatSource = sourceKey(data.source)
+    var heartbeatElapsed = protocolNumber(data.elapsedSeconds, 0, MAX_PROTOCOL_INTEGER, true)
+    if (!heartbeatState || heartbeatSource === "unknown" || heartbeatElapsed === null)
+      return { valid: false, type: "heartbeat" }
     var heartbeat = eventBase("heartbeat")
-    heartbeat.state = data.state === undefined ? "" : normalizeState(data.state)
-    heartbeat.source = sourceKey(data.source)
-    heartbeat.elapsedSeconds = Math.max(0, Math.floor(Number(data.elapsedSeconds) || 0))
+    heartbeat.state = heartbeatState
+    heartbeat.source = heartbeatSource
+    heartbeat.elapsedSeconds = heartbeatElapsed
     return heartbeat
   }
 
@@ -285,6 +347,7 @@ if (typeof module !== "undefined") {
     appendSegment: appendSegment,
     speakerLabel: speakerLabel,
     normalizeState: normalizeState,
+    stateKey: stateKey,
     parseEvent: parseEvent,
     parseCommandResult: parseCommandResult,
     safeError: safeError,

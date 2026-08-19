@@ -11,7 +11,7 @@ body:
     id: plugin-version
     attributes:
       label: Plugin version
-      placeholder: 0.1.0
+      placeholder: 0.2.0
     validations:
       required: true
   - type: input
@@ -24,6 +24,14 @@ body:
     id: whisper-version
     attributes:
       label: whisper.cpp / whisper-server version
+      description: The tested Arch baseline is 1.9.1, but doctor capability-probes the required flags and is authoritative.
+    validations:
+      required: true
+  - type: input
+    id: setpriv-version
+    attributes:
+      label: util-linux / setpriv version
+      description: Paste the sanitized first line of `setpriv --version`; this command is mandatory in v0.2.
     validations:
       required: true
   - type: input
@@ -31,6 +39,14 @@ body:
     attributes:
       label: Model name
       description: Give the model filename, not a private absolute path.
+    validations:
+      required: true
+  - type: input
+    id: language
+    attributes:
+      label: Language setting
+      description: Give the configured value, such as en, auto, or pt-BR. Do not include private paths.
+      placeholder: en
     validations:
       required: true
   - type: dropdown

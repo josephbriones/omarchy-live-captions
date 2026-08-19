@@ -1,20 +1,30 @@
 # Release checklist
 
+Every box is an evidence gate, not a statement that the current checkout passed. Keep a box unchecked until its named environment and artifact have been reviewed; in particular, a skipped `qmllint` or Omarchy-only check is not a pass. The deterministic subprocess suite does not substitute for real-hardware acceptance.
+
 ## Code and compatibility
 
 - [ ] `manifest.json` version matches `CHANGELOG.md` and the intended tag.
 - [ ] The plugin ID is unique and outside the reserved `omarchy.*` namespace.
 - [ ] `bash scripts/validate.sh` passes with no unexplained skips on Omarchy.
+- [ ] `qmllint` completes with the current Omarchy shell imports; it was not merely skipped.
 - [ ] `omarchy plugin validate .` passes on current stable Omarchy.
-- [ ] Supported `whisper-server` versions and at least one documented model pass real-audio acceptance.
+- [ ] Mandatory `setpriv` is present, and `doctor` passes every required `whisper-server` flag on the release machine (the tested Arch baseline is 1.9.1, not a semantic minimum).
+- [ ] A language-compatible documented model passes real-audio acceptance; an English-only model is rejected for `auto` and non-English.
+- [ ] The deterministic fake-command subprocess lifecycle test passes.
 - [ ] Demo, microphone, and desktop paths pass.
 - [ ] Multi-display placement and click-through behavior pass.
-- [ ] Rolling-window duplicate tests and the measured latency gate pass.
+- [ ] Demo Close is exercised while its watcher is running and settles at `open=false`/`running=false`; a second demo finishes idle with the requested source and a nonzero segment count.
+- [ ] Rolling-window word/CJK duplicate tests and the separately observed real-hardware latency gate pass.
 
 ## Privacy and failure cases
 
 - [ ] Opening without Start does not access audio or launch inference.
+- [ ] A resident `keepLoaded` QML owner has no recorder, model server, or audio stream before Start or after Close.
 - [ ] Demo mode creates no runtime audio.
+- [ ] Listening is not shown until the first PCM bytes arrive; no-audio startup fails and cleans up.
+- [ ] Pause drains/discards new PCM and suppresses the current prepared/requested window; no later window starts until Resume while PipeWire remains linked; Stop and Close end capture.
+- [ ] Stale audio backlog stops the session with actionable guidance instead of emitting delayed captions.
 - [ ] Normal stop leaves no WAV or transcript history.
 - [ ] Capture failure terminates the owned inference process.
 - [ ] Inference failure terminates the owned capture process.

@@ -4,15 +4,18 @@ Live Captions never installs software or downloads a model. These are explicit, 
 
 ## 1. Install the local engine
 
-Install the official Arch Extra package through Omarchy's package helper:
+Install the official Arch packages through Omarchy's package helper:
 
 ```bash
 omarchy-pkg-add whisper-cpp
+omarchy-pkg-add util-linux
 ```
 
-Use `whisper.cpp` 1.7.6 or newer. The current Arch package includes `whisper-server`. Confirm that the fixed-argument options used by Live Captions exist. Do not use `--version`: current servers can treat it as an unknown argument while still exiting successfully.
+Live Captions v0.2 was tested against the current Arch `whisper-cpp` 1.9.1 package and requires `setpriv` from `util-linux`; `setpriv` and every probed server capability are mandatory. Version 1.9.1 is a baseline, not a semantic minimum: older or newer `whisper-server` builds may work when they expose the exact fixed-argument options checked by `doctor`. Check the installed package version with `pacman`, confirm `setpriv`, and verify those options. Do not use `whisper-server --version`: compatible servers can treat it as an unknown argument while still exiting successfully.
 
 ```bash
+pacman -Q whisper-cpp
+setpriv --version
 WHISPER_HELP="$(whisper-server --help 2>&1)"
 for flag in --model --host --port --request-path --public; do
   printf '%s\n' "$WHISPER_HELP" | rg -F -- "$flag"
@@ -51,6 +54,8 @@ mv ~/.local/share/omarchy-live-captions/models/ggml-tiny.en.bin.part \
 
 The URL is the model repository used by the upstream `whisper.cpp` project. If verification fails, do not use or rename the partial file.
 
+`ggml-tiny.en.bin` is English-only, so configure it with `--language en`. For `auto` or any other language, choose a multilingual GGML model whose filename does not contain `.en.bin`. Discovery applies the same rule: it skips incompatible English-only models instead of silently using one for another language.
+
 ## 3. Preview and apply plugin preferences
 
 Replace the model path if you selected a different model:
@@ -65,7 +70,7 @@ MODEL=~/.local/share/omarchy-live-captions/models/ggml-tiny.en.bin
 
 The first command is preview-only. `--apply` explicitly writes `$XDG_CONFIG_HOME/omarchy/live-captions/config.json` with mode `0600`. It does not edit PipeWire, Omarchy, Hyprland, or VoxType.
 
-Supported language values are short Whisper language tokens such as `en`, `es`, or `pt-BR`, plus `auto`. Version 0.1 defaults to English.
+Supported language values are Whisper language codes such as `en` or `es`, BCP-47-style tags such as `pt-BR`, and `auto`. Version 0.2 defaults to English. Tags are validated against Whisper's supported languages and reduced to their primary code (`pt-BR` becomes `pt`). English-only `.en.bin` models require `en`; `auto` and non-English choices require a multilingual model.
 
 For a temporary model override, set `LIVE_CAPTIONS_MODEL` to an absolute path in the environment that launches `omarchy-shell`. `LIVE_CAPTIONS_LANGUAGE` similarly overrides the configured language.
 
@@ -75,4 +80,4 @@ For a temporary model override, set `LIVE_CAPTIONS_MODEL` to an absolute path in
 "$HELPER" doctor
 ```
 
-Doctor checks the platform, fixed local executables, preferences, and readable model. It does not start `pw-record`, open an audio source, or launch the inference server. Source-routing failures can still surface after an explicit Start action because PipeWire device availability changes at runtime.
+Doctor checks the platform, mandatory `setpriv`, fixed local executables, supported `whisper-server` options, preferences, and a readable language-compatible model. It does not start `pw-record`, open an audio source, or launch the inference server. Source-routing failures can still surface after an explicit Start action because PipeWire device availability changes at runtime. After Start, the UI waits for the first PCM bytes before reporting Listening and fails the session if no bytes arrive within five seconds.
