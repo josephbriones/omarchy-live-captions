@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1600" viewBox="0 0 1600 1600">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101618"/>
+      <stop offset="0.52" stop-color="#172225"/>
+      <stop offset="1" stop-color="#0b1012"/>
+    </linearGradient>
+    <linearGradient id="pane" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#202b2e" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#12191b" stop-opacity="0.96"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="15" flood-color="#000" flood-opacity="0.48"/>
+    </filter>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="20"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1600" fill="url(#wall)"/>
+  <circle cx="1350" cy="520" r="290" fill="#8fb9ae" opacity="0.06" filter="url(#soft)"/>
+  <circle cx="235" cy="1040" r="250" fill="#be8f77" opacity="0.05" filter="url(#soft)"/>
+
+  <g font-family="Inter, ui-sans-serif, sans-serif">
+    <rect x="84" y="93" width="122" height="122" rx="34" fill="#9fc6ba" fill-opacity="0.13" stroke="#9fc6ba" stroke-width="2"/>
+    <path d="M118 132h54a12 12 0 0 1 12 12v25a12 12 0 0 1-12 12h-26l-18 15v-15h-10a12 12 0 0 1-12-12v-25a12 12 0 0 1 12-12z" fill="#9fc6ba"/>
+    <text x="145" y="165" text-anchor="middle" font-size="24" font-weight="800" fill="#101618">CC</text>
+    <text x="238" y="148" font-size="54" font-weight="760" fill="#f0f4f3">Live Captions</text>
+    <text x="241" y="192" font-size="20" fill="#91a3a3">Private, system-wide captions for anything you hear or say.</text>
+    <rect x="1247" y="116" width="262" height="58" rx="29" fill="#9fc6ba" fill-opacity="0.12" stroke="#9fc6ba" stroke-opacity="0.6"/>
+    <circle cx="1280" cy="145" r="6" fill="#9fc6ba"/>
+    <text x="1298" y="152" font-size="16" font-weight="700" fill="#bed8d1">100% ON-DEVICE</text>
+  </g>
+
+  <g transform="translate(0 350)">
+
+  <!-- Omarchy-like top bar -->
+  <rect x="18" y="16" width="1564" height="44" rx="10" fill="#0a0f10" stroke="#46575a" stroke-width="1"/>
+  <g font-family="Inter, ui-sans-serif, sans-serif" font-size="15" fill="#d6dddd">
+    <rect x="34" y="28" width="21" height="21" rx="5" fill="#9fc6ba"/>
+    <text x="65" y="44" font-weight="700">1</text>
+    <text x="95" y="44" opacity="0.45">2</text>
+    <text x="125" y="44" opacity="0.45">3</text>
+    <text x="744" y="44" text-anchor="middle" font-weight="650">LIVE CAPTIONS</text>
+    <circle cx="1376" cy="38" r="4" fill="#e7786f"/>
+    <text x="1390" y="44" font-size="13" opacity="0.78">LOCAL</text>
+    <text x="1539" y="44" text-anchor="end" font-variant-numeric="tabular-nums">10:42</text>
+  </g>
+
+  <!-- Background apps are intentionally abstract demo content. -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="102" width="880" height="610" rx="13" fill="url(#pane)" stroke="#445255"/>
+    <rect x="70" y="102" width="880" height="46" rx="13" fill="#263235"/>
+    <rect x="70" y="136" width="880" height="12" fill="#263235"/>
+    <circle cx="95" cy="125" r="6" fill="#d56b63"/>
+    <circle cx="116" cy="125" r="6" fill="#d4a85f"/>
+    <circle cx="137" cy="125" r="6" fill="#78ad88"/>
+    <text x="168" y="131" font-family="ui-monospace, SFMono-Regular, monospace" font-size="13" fill="#b7c2c2">caption-engine — local session</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, monospace" font-size="17">
+      <text x="104" y="194" fill="#8eb8ac">$</text>
+      <text x="128" y="194" fill="#d0d8d8">live-captions doctor</text>
+      <text x="104" y="237" fill="#718183">backend</text>
+      <text x="246" y="237" fill="#cbd5d4">whisper.cpp · local</text>
+      <text x="104" y="270" fill="#718183">source</text>
+      <text x="246" y="270" fill="#cbd5d4">desktop audio</text>
+      <text x="104" y="303" fill="#718183">retention</text>
+      <text x="246" y="303" fill="#9fc6ba">none</text>
+      <text x="104" y="336" fill="#718183">network</text>
+      <text x="246" y="336" fill="#9fc6ba">loopback only</text>
+      <text x="104" y="389" fill="#8eb8ac">●</text>
+      <text x="128" y="389" fill="#d0d8d8">Listening…</text>
+      <rect x="104" y="428" width="775" height="1" fill="#37474a"/>
+      <text x="104" y="474" fill="#718183">Audio stays in memory.</text>
+      <text x="104" y="508" fill="#718183">Caption text stays on screen.</text>
+    </g>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="980" y="102" width="550" height="610" rx="13" fill="#182225" stroke="#445255"/>
+    <rect x="980" y="102" width="550" height="46" rx="13" fill="#263235"/>
+    <text x="1008" y="132" font-family="Inter, ui-sans-serif, sans-serif" font-size="13" fill="#bdc8c8">LOCAL DEMO VIDEO</text>
+    <rect x="1008" y="174" width="494" height="322" rx="10" fill="#0d1315"/>
+    <circle cx="1255" cy="320" r="93" fill="#26373a"/>
+    <circle cx="1255" cy="278" r="38" fill="#819b95"/>
+    <path d="M1178 401c17-58 138-58 155 0" fill="#819b95"/>
+    <circle cx="1457" cy="455" r="24" fill="#e7786f" opacity="0.9"/>
+    <path d="M1449 447l17 9-17 9z" fill="#101618"/>
+    <g font-family="Inter, ui-sans-serif, sans-serif">
+      <text x="1008" y="544" font-size="13" fill="#78898a">DEMO SCENARIO</text>
+      <text x="1008" y="579" font-size="22" fill="#d5dddd" font-weight="650">Captions wherever audio plays</text>
+      <text x="1008" y="613" font-size="15" fill="#8fa0a1">Calls, classes, videos, and presentations.</text>
+      <rect x="1008" y="648" width="160" height="34" rx="17" fill="#9fc6ba" fill-opacity="0.13" stroke="#9fc6ba" stroke-opacity="0.55"/>
+      <circle cx="1030" cy="665" r="4" fill="#9fc6ba"/>
+      <text x="1043" y="670" font-size="13" fill="#bcd6cf">ON-DEVICE</text>
+    </g>
+  </g>
+
+  <!-- Focused-screen controls -->
+  <g filter="url(#shadow)" font-family="Inter, ui-sans-serif, sans-serif">
+    <rect x="399" y="654" width="802" height="54" rx="27" fill="#0b1112" fill-opacity="0.97" stroke="#8aa69f" stroke-opacity="0.74"/>
+    <circle cx="430" cy="681" r="6" fill="#e7786f"/>
+    <text x="447" y="686" font-size="13" fill="#dde4e3" font-weight="700">CAPTIONING</text>
+    <rect x="546" y="665" width="1" height="32" fill="#39484a"/>
+    <text x="570" y="686" font-size="14" fill="#aebcbb">Desktop audio</text>
+    <text x="728" y="686" font-size="14" fill="#aebcbb">00:18</text>
+    <rect x="812" y="665" width="1" height="32" fill="#39484a"/>
+    <text x="840" y="687" font-size="18" fill="#d7dede">A−</text>
+    <text x="893" y="687" font-size="18" fill="#d7dede">A+</text>
+    <text x="953" y="686" font-size="14" fill="#aebcbb">Bottom</text>
+    <rect x="1041" y="664" width="133" height="34" rx="17" fill="#e7786f" fill-opacity="0.16" stroke="#e7786f" stroke-opacity="0.7"/>
+    <rect x="1061" y="675" width="11" height="11" rx="2" fill="#e7786f"/>
+    <text x="1083" y="687" font-size="14" fill="#f0c4c0" font-weight="650">Stop</text>
+  </g>
+
+  <!-- Caption surface -->
+  <g filter="url(#shadow)" font-family="Inter, ui-sans-serif, sans-serif">
+    <rect x="178" y="741" width="1244" height="122" rx="16" fill="#090e0f" fill-opacity="0.96" stroke="#94b2aa" stroke-width="2"/>
+    <rect x="202" y="764" width="133" height="27" rx="13.5" fill="#9fc6ba" fill-opacity="0.15"/>
+    <circle cx="220" cy="777.5" r="4" fill="#9fc6ba"/>
+    <text x="232" y="783" font-size="13" fill="#bcd6cf" font-weight="650">DESKTOP AUDIO</text>
+    <text x="202" y="832" font-size="30" fill="#f2f5f4" font-weight="620">The goal is access without sending the conversation anywhere.</text>
+  </g>
+
+    <text x="1570" y="884" text-anchor="end" font-family="Inter, ui-sans-serif, sans-serif" font-size="12" fill="#778687">ILLUSTRATED DEMO · NO RECORDED AUDIO</text>
+  </g>
+
+  <g font-family="Inter, ui-sans-serif, sans-serif">
+    <rect x="102" y="1357" width="426" height="118" rx="22" fill="#11191b" stroke="#405154"/>
+    <circle cx="148" cy="1416" r="21" fill="#9fc6ba" fill-opacity="0.16"/>
+    <path d="M141 1416h14M148 1409v14" stroke="#9fc6ba" stroke-width="3" stroke-linecap="round"/>
+    <text x="184" y="1409" font-size="18" font-weight="700" fill="#dce3e2">Any display</text>
+    <text x="184" y="1439" font-size="14" fill="#879898">Theme-aware, click-through overlay</text>
+
+    <rect x="587" y="1357" width="426" height="118" rx="22" fill="#11191b" stroke="#405154"/>
+    <circle cx="633" cy="1416" r="21" fill="#9fc6ba" fill-opacity="0.16"/>
+    <path d="M624 1416l7 7 13-16" fill="none" stroke="#9fc6ba" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="669" y="1409" font-size="18" font-weight="700" fill="#dce3e2">No retention</text>
+    <text x="669" y="1439" font-size="14" fill="#879898">Audio and captions stay in memory</text>
+
+    <rect x="1072" y="1357" width="426" height="118" rx="22" fill="#11191b" stroke="#405154"/>
+    <circle cx="1118" cy="1416" r="21" fill="#9fc6ba" fill-opacity="0.16"/>
+    <path d="M1108 1418c4-10 16-10 20 0M1118 1408v18" fill="none" stroke="#9fc6ba" stroke-width="3" stroke-linecap="round"/>
+    <text x="1154" y="1409" font-size="18" font-weight="700" fill="#dce3e2">Mic or desktop</text>
+    <text x="1154" y="1439" font-size="14" fill="#879898">Explicit source every session</text>
+  </g>
+</svg>

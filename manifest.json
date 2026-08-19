@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.josephbriones.live-captions",
+  "name": "Live Captions",
+  "version": "0.1.0",
+  "author": "Joseph Briones",
+  "license": "MIT",
+  "description": "Local captions for microphone or desktop audio, with no recording or transcript saved.",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "LiveCaptions.qml"
+  }
+}
