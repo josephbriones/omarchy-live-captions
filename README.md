@@ -81,7 +81,7 @@ Select **Microphone** to caption the default PipeWire input, or **Desktop audio*
 
 Startup reports **Listening** only after `pw-record` supplies the first PCM bytes. If the selected route supplies no audio within five seconds, startup fails and both owned children are cleaned up.
 
-The overlay puts click-through caption cards on every display and keeps its controls on the focused display. You can pause captions, stop, move captions to the top or bottom, change text size, and choose how many lines remain visible.
+The overlay puts click-through caption cards on every display and keeps its controls on the focused display. You can pause captions, stop, move captions to the top or bottom, change text size, and choose how many lines remain visible. Tab and Shift+Tab move through every control, Enter or Space activates it, and Escape closes the overlay and stops capture.
 
 Pause keeps `pw-record` running and the PipeWire stream linked, but drains and discards new PCM without showing new captions. The one window already being prepared or requested may finish locally after Pause; its result is suppressed, and no later window starts until Resume. Resume starts with fresh audio. Use **Stop** or **Close** when capture should end completely.
 

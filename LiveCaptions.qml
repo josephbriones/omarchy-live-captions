@@ -93,12 +93,22 @@ Item {
     return screens[0]
   }
 
+  component AccessButton: Button {
+    focusable: true
+    Accessible.role: Accessible.Button
+    Accessible.name: text
+    Accessible.focusable: enabled && visible
+    Accessible.focused: activeFocus
+    Accessible.onPressAction: if (enabled) clicked()
+  }
+
   function open(payloadJson) {
     var options = CaptionModel.parsePayload(payloadJson)
     if (opened && (doctorProcess.running || watchProcess.running || activeState)) {
       // A second summon reveals controls, but it must never swap an audio
       // source or turn a real capture into a demo mid-session.
       controlsExpanded = true
+      controlWindow.primeKeyboardFocus()
       return
     }
     if (!opened && (doctorProcess.running || watchProcess.running || doctorExpectedStop || explicitStop)) {
@@ -134,6 +144,7 @@ Item {
     explicitStop = false
     phase = demoMode ? "starting" : "checking"
     opened = true
+    controlWindow.primeKeyboardFocus()
 
     if (demoMode) {
       Qt.callLater(function() {
@@ -585,6 +596,17 @@ Item {
   // click-through just like the caption surfaces above.
   PanelWindow {
     id: controlWindow
+    property bool focusPrimed: false
+
+    function primeKeyboardFocus() {
+      if (!root.opened || !visible) return
+      focusPrimed = false
+      focusPrimeTimer.restart()
+      Qt.callLater(function() {
+        if (root.opened && controlWindow.visible) expandButton.forceActiveFocus()
+      })
+    }
+
     screen: root.controlScreen
     visible: root.opened && root.controlScreen !== null
     anchors { top: true; right: true; bottom: true; left: true }
@@ -592,8 +614,35 @@ Item {
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.namespace: "live-captions-controls"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    // Match Omarchy's KeyboardPanel contract: briefly acquire focus on map,
+    // then settle to OnDemand so other outputs keep normal pointer routing.
+    // Closing releases keyboard ownership immediately, before process cleanup.
+    WlrLayershell.keyboardFocus: root.opened && visible
+      ? (focusPrimed ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.Exclusive)
+      : WlrKeyboardFocus.None
     mask: Region { item: controlCard }
+
+    onVisibleChanged: {
+      if (visible) primeKeyboardFocus()
+      else focusPrimeTimer.stop()
+    }
+
+    Connections {
+      target: root
+      function onOpenedChanged() {
+        if (root.opened) controlWindow.primeKeyboardFocus()
+        else {
+          focusPrimeTimer.stop()
+          controlWindow.focusPrimed = false
+        }
+      }
+    }
+
+    Timer {
+      id: focusPrimeTimer
+      interval: 75
+      onTriggered: if (root.opened) controlWindow.focusPrimed = true
+    }
 
     BorderSurface {
       id: controlCard
@@ -608,6 +657,12 @@ Item {
       color: Util.alpha(Color.popups.background, 0.97)
       borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
+      Accessible.role: Accessible.Dialog
+      Accessible.name: "Live Captions controls"
+      Keys.onEscapePressed: function(event) {
+        root.dismiss()
+        event.accepted = true
+      }
 
       Column {
         id: controlColumn
@@ -638,30 +693,40 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.subtitle
               font.bold: true
+              Accessible.role: Accessible.Heading
+              Accessible.name: text
             }
             Text {
               text: root.statusText + (root.activeState && !root.demoMode ? " · " + CaptionModel.formatElapsed(root.elapsedSeconds) : "")
               color: Util.alpha(Color.popups.text, 0.68)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+              Accessible.role: Accessible.StatusBar
+              Accessible.name: text
             }
           }
-          Button {
+          AccessButton {
+            id: expandButton
             text: root.controlsExpanded ? "Less" : "More"
             foreground: Color.popups.text
             fontSize: Style.font.caption
             horizontalPadding: Style.space(7)
             verticalPadding: Style.space(5)
             tooltipText: root.controlsExpanded ? "Collapse controls" : "Expand controls"
+            Accessible.name: root.controlsExpanded
+              ? "Collapse Live Captions controls"
+              : "Expand Live Captions controls"
             onClicked: root.controlsExpanded = !root.controlsExpanded
           }
-          Button {
+          AccessButton {
             text: "Close"
             foreground: Color.popups.text
             fontSize: Style.font.caption
             horizontalPadding: Style.space(7)
             verticalPadding: Style.space(5)
             tooltipText: "Close and stop any active capture"
+            Accessible.name: "Close Live Captions and stop capture"
+            Accessible.description: tooltipText
             onClicked: root.dismiss()
           }
         }
@@ -678,6 +743,8 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
           }
 
           Column {
@@ -691,6 +758,8 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.subtitle
               font.bold: true
+              Accessible.role: Accessible.Heading
+              Accessible.name: text
             }
             Text {
               width: parent.width
@@ -712,21 +781,24 @@ Item {
             Row {
               spacing: Style.space(8)
 
-              Button {
+              AccessButton {
                 text: root.doctorSeen ? "Check again" : "Checking…"
                 iconText: "↻"
                 enabled: root.doctorSeen && !doctorProcess.running
                 foreground: Color.popups.text
                 bordered: true
+                Accessible.name: "Check local caption setup again"
                 onClicked: root.retryDoctor()
               }
-              Button {
+              AccessButton {
                 text: "Try demo"
                 iconText: "▶"
                 enabled: !doctorProcess.running && !watchProcess.running
                 foreground: Color.popups.text
                 accent: Color.accent
                 bordered: true
+                Accessible.name: "Try Live Captions demo"
+                Accessible.description: "Starts synthetic captions without opening an audio device"
                 onClicked: root.open(JSON.stringify({
                   demo: true,
                   source: root.selectedSource,
@@ -746,6 +818,8 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+            Accessible.role: Accessible.StatusBar
+            Accessible.name: text
           }
 
           Column {
@@ -760,26 +834,36 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               font.bold: true
+              Accessible.role: Accessible.Heading
+              Accessible.name: text
             }
             Row {
               visible: !root.demoMode
               spacing: Style.space(8)
-              Button {
+              AccessButton {
                 text: "Microphone"
                 selected: root.selectedSource === "microphone"
                 enabled: !root.activeState && !watchProcess.running
                 foreground: Color.popups.text
                 accent: Color.accent
                 bordered: true
+                Accessible.role: Accessible.RadioButton
+                Accessible.name: "Microphone audio source"
+                Accessible.checkable: true
+                Accessible.checked: selected
                 onClicked: root.selectedSource = "microphone"
               }
-              Button {
+              AccessButton {
                 text: "Desktop audio"
                 selected: root.selectedSource === "desktop"
                 enabled: !root.activeState && !watchProcess.running
                 foreground: Color.popups.text
                 accent: Color.accent
                 bordered: true
+                Accessible.role: Accessible.RadioButton
+                Accessible.name: "Desktop audio source"
+                Accessible.checkable: true
+                Accessible.checked: selected
                 onClicked: root.selectedSource = "desktop"
               }
             }
@@ -787,7 +871,7 @@ Item {
             Row {
               spacing: Style.space(8)
 
-              Button {
+              AccessButton {
                 visible: !root.demoMode && (root.phase === "idle" || root.phase === "error")
                 text: "Start captions"
                 iconText: "●"
@@ -795,27 +879,30 @@ Item {
                 foreground: Color.popups.text
                 accent: Color.accent
                 bordered: true
+                Accessible.name: "Start live captions"
                 onClicked: root.beginCaptions()
               }
-              Button {
+              AccessButton {
                 visible: !root.demoMode && (root.phase === "listening" || root.phase === "recording")
                 text: "Pause"
                 iconText: "Ⅱ"
                 enabled: watchProcess.running
                 foreground: Color.popups.text
                 bordered: true
+                Accessible.name: "Pause live captions"
                 onClicked: root.runAction("pause")
               }
-              Button {
+              AccessButton {
                 visible: !root.demoMode && root.phase === "paused"
                 text: "Resume"
                 iconText: "▶"
                 enabled: watchProcess.running
                 foreground: Color.popups.text
                 bordered: true
+                Accessible.name: "Resume live captions"
                 onClicked: root.runAction("resume")
               }
-              Button {
+              AccessButton {
                 visible: !root.demoMode && watchProcess.running
                 text: root.phase === "stopping" ? "Stopping…" : "Stop"
                 iconText: "■"
@@ -823,6 +910,9 @@ Item {
                 foreground: Color.urgent
                 accent: Color.urgent
                 bordered: true
+                Accessible.name: root.phase === "stopping"
+                  ? "Stopping live captions"
+                  : "Stop live captions"
                 onClicked: root.runAction("stop")
               }
               Text {
@@ -862,6 +952,8 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+            Accessible.role: Accessible.AlertMessage
+            Accessible.name: text
           }
 
           Rectangle {
@@ -876,6 +968,8 @@ Item {
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             font.bold: true
+            Accessible.role: Accessible.Heading
+            Accessible.name: text
           }
 
           RowLayout {
@@ -888,11 +982,13 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
-            Button {
+            AccessButton {
               text: "A−"
               enabled: root.fontScale > 0.8
               foreground: Color.popups.text
               bordered: true
+              Accessible.name: "Decrease caption text size"
+              Accessible.description: "Current size " + Math.round(root.fontScale * 100) + " percent"
               onClicked: root.fontScale = CaptionModel.clamp(root.fontScale - 0.1, 0.8, 1.8)
             }
             Text {
@@ -901,11 +997,13 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
-            Button {
+            AccessButton {
               text: "A+"
               enabled: root.fontScale < 1.8
               foreground: Color.popups.text
               bordered: true
+              Accessible.name: "Increase caption text size"
+              Accessible.description: "Current size " + Math.round(root.fontScale * 100) + " percent"
               onClicked: root.fontScale = CaptionModel.clamp(root.fontScale + 0.1, 0.8, 1.8)
             }
           }
@@ -920,11 +1018,13 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
-            Button {
+            AccessButton {
               text: "−"
               enabled: root.maxRows > 1
               foreground: Color.popups.text
               bordered: true
+              Accessible.name: "Show fewer caption lines"
+              Accessible.description: "Currently showing " + root.maxRows + " lines"
               onClicked: root.maxRows = Math.max(1, root.maxRows - 1)
             }
             Text {
@@ -933,11 +1033,13 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
-            Button {
+            AccessButton {
               text: "+"
               enabled: root.maxRows < 5
               foreground: Color.popups.text
               bordered: true
+              Accessible.name: "Show more caption lines"
+              Accessible.description: "Currently showing " + root.maxRows + " lines"
               onClicked: root.maxRows = Math.min(5, root.maxRows + 1)
             }
           }
@@ -952,20 +1054,28 @@ Item {
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
-            Button {
+            AccessButton {
               text: "Top"
               selected: root.captionPosition === "top"
               foreground: Color.popups.text
               accent: Color.accent
               bordered: true
+              Accessible.role: Accessible.RadioButton
+              Accessible.name: "Place captions at top"
+              Accessible.checkable: true
+              Accessible.checked: selected
               onClicked: root.captionPosition = "top"
             }
-            Button {
+            AccessButton {
               text: "Bottom"
               selected: root.captionPosition === "bottom"
               foreground: Color.popups.text
               accent: Color.accent
               bordered: true
+              Accessible.role: Accessible.RadioButton
+              Accessible.name: "Place captions at bottom"
+              Accessible.checkable: true
+              Accessible.checked: selected
               onClicked: root.captionPosition = "bottom"
             }
           }

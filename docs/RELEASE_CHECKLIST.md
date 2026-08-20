@@ -14,6 +14,7 @@ Every box is an evidence gate, not a statement that the current checkout passed.
 - [ ] The deterministic fake-command subprocess lifecycle test passes.
 - [ ] Demo, microphone, and desktop paths pass.
 - [ ] Multi-display placement and click-through behavior pass.
+- [ ] Keyboard focus enters the control card, every enabled action works with Tab plus Enter/Space, radio state and names are announced by assistive technology, and Escape closes and releases focus.
 - [ ] Demo Close is exercised while its watcher is running and settles at `open=false`/`running=false`; a second demo finishes idle with the requested source and a nonzero segment count.
 - [ ] Rolling-window word/CJK duplicate tests and the separately observed real-hardware latency gate pass.
 
@@ -24,7 +25,7 @@ Every box is an evidence gate, not a statement that the current checkout passed.
 - [ ] Demo mode creates no runtime audio.
 - [ ] Listening is not shown until the first PCM bytes arrive; no-audio startup fails and cleans up.
 - [ ] Pause drains/discards new PCM and suppresses the current prepared/requested window; no later window starts until Resume while PipeWire remains linked; Stop and Close end capture.
-- [ ] Stale audio backlog stops the session with actionable guidance instead of emitting delayed captions.
+- [ ] Stale audio backlog stops the session with actionable guidance, and no completed inference caption is emitted before that failure.
 - [ ] Normal stop leaves no WAV or transcript history.
 - [ ] Capture failure terminates the owned inference process.
 - [ ] Inference failure terminates the owned capture process.

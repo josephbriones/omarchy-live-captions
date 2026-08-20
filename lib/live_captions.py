@@ -609,6 +609,10 @@ class TranscriptDeduper:
   def history(self) -> tuple[str, ...]:
     return tuple(self._history)
 
+  def reset(self) -> None:
+    self._history.clear()
+    self._character_history = ""
+
   def novel_text(self, text: object) -> str:
     cleaned = clean_message(text, 4000)
     original = cleaned.split()
@@ -1080,6 +1084,16 @@ class CaptureReader:
       except queue.Empty:
         return
 
+  def pending_audio_is_stale(self, now: float | None = None) -> bool:
+    """Return whether inference has left live audio too old to caption."""
+    checked_at = time.monotonic() if now is None else now
+    with self.queue.mutex:
+      oldest = next(
+        (item for item in self.queue.queue if isinstance(item, CapturedChunk)),
+        None,
+      )
+    return oldest is not None and checked_at - oldest.captured_at > MAX_CAPTURE_BACKLOG_SECONDS
+
 
 class CaptionSession:
   def __init__(
@@ -1422,6 +1436,7 @@ class CaptionSession:
         del audio[: WINDOW_BYTES - OVERLAP_BYTES]
         inference_epoch = local_epoch
         if pcm_level(window_pcm) < SILENCE_RMS_THRESHOLD:
+          deduper.reset()
           sequence += 1
           continue
         inference_started = time.monotonic()
@@ -1432,8 +1447,6 @@ class CaptionSession:
             break
           raise
         inference_ms = max(0, int((time.monotonic() - inference_started) * 1000))
-        if self.reader.overflowed.is_set():
-          raise self._backlog_error()
         with self._state_lock:
           if self.paused or self.transition_epoch != inference_epoch:
             audio.clear()
@@ -1441,6 +1454,8 @@ class CaptionSession:
             local_epoch = self.transition_epoch
             sequence += 1
             continue
+          if self.reader.overflowed.is_set() or self.reader.pending_audio_is_stale():
+            raise self._backlog_error()
           text = deduper.novel_text(raw_text)
           end_ms = sequence * (WINDOW_SECONDS - OVERLAP_SECONDS) * 1000 + WINDOW_SECONDS * 1000
           if text:

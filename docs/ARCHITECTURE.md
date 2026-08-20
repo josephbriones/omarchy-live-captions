@@ -22,7 +22,7 @@ microphone OR desktop monitor
 
 The Quattro entry point implements `open(payloadJson)` and `close()`. The host injects its shell and manifest properties after construction, so those properties are not required during component creation.
 
-One transparent layer-shell window is created for every display. Caption cards use an empty input region, leaving applications beneath clickable. A focused-display control surface provides the interactive Start, Stop, source, size, and position controls without turning the whole overlay into a click target.
+One transparent layer-shell window is created for every display. Caption cards use an empty input region, leaving applications beneath clickable. A focused-display control surface provides keyboard- and assistive-technology-accessible Start, Stop, source, size, and position controls without turning the whole overlay into a click target. It uses Omarchy's brief exclusive focus prime, settles to on-demand focus, and releases keyboard ownership as soon as the overlay closes.
 
 The root QML object owns one watcher process. Pause and resume travel over that process's stdin. Closing the overlay clears caption text, stops the same QML-owned process, and keeps the invisible QML owner alive long enough for bounded child cleanup.
 
@@ -41,8 +41,8 @@ The helper:
 - starts one `pw-record` process for the chosen source;
 - starts one persistent local `whisper-server` for the chosen model, hard-bound to a random loopback port and tokenized request path;
 - rotates overlapping audio windows through inference;
-- de-duplicates normalized word overlap, with exact-character overlap for unspaced CJK text, and emits bounded caption events;
-- rejects stale audio when the selected model cannot keep up with the live stream;
+- de-duplicates normalized word overlap, with exact-character overlap for unspaced CJK text, and resets that history after a fully silent window;
+- rejects stale audio before emitting an inference result when the selected model cannot keep up with the live stream;
 - stops only processes belonging to its own session;
 - emits deterministic no-audio demo events.
 

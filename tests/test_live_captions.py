@@ -555,6 +555,21 @@ class LocalWhisperClientTests(unittest.TestCase):
 
 
 class CaptureReaderTests(unittest.TestCase):
+  def test_reports_stale_pending_audio_without_consuming_it(self) -> None:
+    reader = captions.CaptureReader(io.BytesIO(), threading.Event())
+    captured = captions.CapturedChunk(b"pending", 0, 10.0)
+    reader.queue.put(captured)
+    reader.queue.put(None)
+
+    self.assertFalse(
+      reader.pending_audio_is_stale(now=10.0 + captions.MAX_CAPTURE_BACKLOG_SECONDS)
+    )
+    self.assertTrue(
+      reader.pending_audio_is_stale(now=10.0 + captions.MAX_CAPTURE_BACKLOG_SECONDS + 0.001)
+    )
+    self.assertEqual(reader.queue.get_nowait(), captured)
+    self.assertIsNone(reader.queue.get_nowait())
+
   def test_queue_overflow_drops_oldest_without_blocking(self) -> None:
     reader = captions.CaptureReader(io.BytesIO(), threading.Event())
     reader.queue = queue.Queue(maxsize=2)

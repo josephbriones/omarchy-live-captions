@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow [Semantic Versioning](h
 
 ## [Unreleased]
 
+### Fixed
+
+- Suppress completed inference results when queued audio has already crossed the live-backlog limit.
+- Reset word and CJK overlap history after a fully silent window so later repeated speech remains intact.
+- Make every visible control keyboard- and assistive-technology-accessible while keeping caption surfaces click-through.
+
+### Changed
+
+- Add pinned Arch CI coverage for Omarchy validation and `qmllint` against the current shell imports.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
