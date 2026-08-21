@@ -4,8 +4,10 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -160,6 +162,77 @@ class ShutdownAfterCaptionWriter(captions.EventWriter):
   "requires POSIX process groups and signals",
 )
 class WatchProcessIntegrationTests(unittest.TestCase):
+  @unittest.skipUnless(
+    sys.platform.startswith("linux") and shutil.which("setpriv"),
+    "requires Linux setpriv parent-death signals",
+  )
+  def test_native_setpriv_parent_death_stops_the_owned_watcher(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      work = Path(temporary)
+      child_pid_file = work / "child.pid"
+      child_ready_file = work / "child.ready"
+      child_stopped_file = work / "child.stopped"
+      worker = write_executable(work / "worker", """
+        #!/usr/bin/env python3
+        import os
+        from pathlib import Path
+        import signal
+        import time
+
+        stopped = Path(os.environ["CHILD_STOPPED"])
+        def stop(_number, _frame):
+          stopped.write_text("stopped", encoding="ascii")
+          raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, stop)
+        Path(os.environ["CHILD_READY"]).write_text("ready", encoding="ascii")
+        while True:
+          time.sleep(0.05)
+      """)
+      owner = write_executable(work / "owner", """
+        #!/usr/bin/env python3
+        import os
+        from pathlib import Path
+        import subprocess
+        import time
+
+        child = subprocess.Popen([
+          "setpriv", "--pdeathsig", "TERM", "--", os.environ["WORKER"]
+        ])
+        Path(os.environ["CHILD_PID"]).write_text(str(child.pid), encoding="ascii")
+        deadline = time.monotonic() + 3
+        ready = Path(os.environ["CHILD_READY"])
+        while not ready.exists() and time.monotonic() < deadline:
+          time.sleep(0.01)
+        if not ready.exists():
+          child.terminate()
+          raise SystemExit("child did not become ready")
+      """)
+      environment = dict(os.environ)
+      environment.update({
+        "WORKER": str(worker),
+        "CHILD_PID": str(child_pid_file),
+        "CHILD_READY": str(child_ready_file),
+        "CHILD_STOPPED": str(child_stopped_file),
+      })
+
+      owner_process = subprocess.run(
+        [str(owner)],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+      )
+      self.assertEqual(owner_process.returncode, 0, owner_process.stderr.decode())
+      child_pid = int(child_pid_file.read_text(encoding="ascii"))
+      deadline = time.monotonic() + 3
+      while process_exists(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+      self.assertFalse(process_exists(child_pid), child_pid)
+      self.assertEqual(child_stopped_file.read_text(encoding="ascii"), "stopped")
+
   def test_real_subprocess_pipeline_captions_and_reaps_children(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
       work = Path(temporary)
@@ -195,7 +268,6 @@ class WatchProcessIntegrationTests(unittest.TestCase):
       with (
         mock.patch.dict(os.environ, environment),
         mock.patch.object(captions, "platform_supported", return_value=True),
-        mock.patch.object(captions, "arm_parent_death_signal"),
         mock.patch.object(captions, "executable", side_effect=executable),
         mock.patch.object(captions.sys, "stdin", io.StringIO("")),
       ):

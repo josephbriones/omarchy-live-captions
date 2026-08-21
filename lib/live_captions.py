@@ -12,7 +12,6 @@ import argparse
 from array import array
 from collections import deque
 import contextlib
-import ctypes
 from dataclasses import dataclass
 import fcntl
 import http.client
@@ -787,25 +786,6 @@ def reserve_loopback_port() -> int:
   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
     listener.bind(("127.0.0.1", 0))
     return int(listener.getsockname()[1])
-
-
-def _parent_death_signal() -> None:
-  if not sys.platform.startswith("linux"):
-    return
-  try:
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.prctl(1, int(signal.SIGTERM), 0, 0, 0)
-  except (AttributeError, OSError):
-    return
-
-
-def arm_parent_death_signal() -> None:
-  if not sys.platform.startswith("linux"):
-    return
-  parent = os.getppid()
-  _parent_death_signal()
-  if os.getppid() != parent:
-    os.kill(os.getpid(), signal.SIGTERM)
 
 
 class DiagnosticDrain:
@@ -1596,7 +1576,6 @@ def run_watch_session(
       previous[number] = signal.getsignal(number)
       signal.signal(number, handle_signal)
   try:
-    arm_parent_death_signal()
     writer.emit({"type": "status", "state": "starting", "source": source, "elapsedSeconds": 0})
     if writer.broken.is_set():
       return 1
@@ -1688,10 +1667,6 @@ def main(argv: Sequence[str] | None = None) -> int:
       )
       return 0
     if args.command == "watch":
-      # Arm the foreground helper before model discovery or any other setup.
-      # If Quickshell disappears during startup, the helper must not survive
-      # long enough to open audio as an orphan.
-      arm_parent_death_signal()
       writer = EventWriter()
       if args.demo:
         return run_demo(writer, source=args.source or "microphone")

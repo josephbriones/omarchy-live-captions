@@ -9,10 +9,14 @@ All notable changes are documented here. Versions follow [Semantic Versioning](h
 - Suppress completed inference results when queued audio has already crossed the live-backlog limit.
 - Reset word and CJK overlap history after a fully silent window so later repeated speech remains intact.
 - Make every visible control keyboard- and assistive-technology-accessible while keeping caption surfaces click-through.
+- Remap long-lived caption and control surfaces after monitor-layout changes so docking cannot strand them off-screen.
+- Bound the control card to the display and keep keyboard-focused controls visible in a scrollable viewport.
+- Keep caption cards inside narrow and short displays while preserving the newest caption blocks at large text scales.
 
 ### Changed
 
 - Add pinned Arch CI coverage for Omarchy validation and `qmllint` against the current shell imports.
+- Launch the real watcher with Omarchy's native `setpriv --pdeathsig TERM` process contract instead of a private `ctypes`/`prctl` shim.
 
 ## [0.2.0] - 2026-08-19
 

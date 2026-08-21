@@ -25,7 +25,7 @@ Live Captions keeps a small operational surface:
 - Model and configuration paths are validated before use and passed as argument values, never evaluated as shell source.
 - Structured events use standard output; diagnostics use standard error.
 - Quickshell keeps the lightweight QML owner resident, but audio starts only after an explicit Start action. It owns the watcher directly and sends pause/resume over its private stdin pipe. While paused, `pw-record` keeps running and linked; the helper drains and discards new PCM and suppresses caption output. The one window already being prepared or requested may finish locally, but no later window starts until Resume. Stop or Close ends capture; the helper then signals only live `Popen` children in the process groups it created. No PID file or process-name match is trusted.
-- `setpriv --pdeathsig KILL` is mandatory and supplies a hard-death fallback for the owned recorder and inference server if their watcher disappears.
+- The shell launches the real watcher with `setpriv --pdeathsig TERM`, matching Omarchy's native long-lived-helper contract and allowing bounded cleanup after an abrupt shell exit. Each recorder and inference process also uses mandatory `setpriv --pdeathsig KILL` as the hard fallback if its watcher disappears first.
 - Demo mode does not access audio or inference.
 
 Dependencies remain part of the trust boundary:

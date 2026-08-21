@@ -78,6 +78,31 @@ class QmlSafetyTests(unittest.TestCase):
     self.assertIn("ExclusionMode.Ignore", caption_surface)
     self.assertNotIn("AccessButton", caption_surface)
 
+  def test_caption_surface_stays_screen_safe_and_keeps_newest_blocks_visible(self) -> None:
+    caption_surface = self.qml[
+      self.qml.index("PanelWindow {\n      id: captionWindow")
+      : self.qml.index("// One small interactive card")
+    ]
+    for contract in (
+      "Math.min(Style.space(900), captionWindow.width - Style.space(48))",
+      "Math.min(desiredHeight, captionWindow.height - Style.space(64))",
+      "id: captionViewport",
+      "clip: true",
+      "captionViewport.height - implicitHeight",
+    ):
+      self.assertIn(contract, caption_surface)
+    self.assertNotIn("Math.max(Style.space(300)", caption_surface)
+    self.assertIn('text: "Caption blocks"', self.qml)
+    self.assertIn('Accessible.name: "Show fewer caption blocks"', self.qml)
+    self.assertIn('Accessible.name: "Show more caption blocks"', self.qml)
+
+  def test_long_lived_surfaces_use_omarchy_screen_move_remapping(self) -> None:
+    self.assertEqual(self.qml.count("ScreenMoveRemap {"), 2)
+    self.assertIn("visible: root.captionSurfaceVisible && !captionRemapGuard.remapping", self.qml)
+    self.assertIn("visible: root.opened && root.controlScreen !== null && !controlRemapGuard.remapping", self.qml)
+    self.assertIn("window: captionWindow", self.qml)
+    self.assertIn("window: controlWindow", self.qml)
+
   def test_control_surface_uses_omarchy_keyboard_focus_lifecycle(self) -> None:
     controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
     self.assertIn("WlrKeyboardFocus.Exclusive", controls)
@@ -88,6 +113,19 @@ class QmlSafetyTests(unittest.TestCase):
     self.assertIn("controlWindow.primeKeyboardFocus()", self.qml)
     self.assertIn("Keys.onEscapePressed", controls)
     self.assertIn("mask: Region { item: controlCard }", controls)
+
+  def test_control_card_is_bounded_scrollable_and_keeps_focus_visible(self) -> None:
+    controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
+    self.assertIn("controlWindow.height - Style.space(32)", controls)
+    self.assertIn("id: controlViewport", controls)
+    self.assertIn("contentHeight: controlColumn.implicitHeight", controls)
+    self.assertIn("boundsBehavior: Flickable.StopAtBounds", controls)
+    self.assertIn("Controls.ScrollBar.vertical", controls)
+    self.assertIn("function revealControl(item)", self.qml)
+    self.assertIn("item.mapToItem(controlViewport.contentItem, 0, 0)", self.qml)
+    self.assertIn("Qt.callLater(function() { root.revealControl(accessButton) })", self.qml)
+    self.assertIn("onImplicitHeightChanged:", controls)
+    self.assertIn("root.focusedControl.activeFocus", controls)
 
   def test_every_control_button_is_keyboard_and_at_accessible(self) -> None:
     controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
@@ -176,6 +214,17 @@ class QmlSafetyTests(unittest.TestCase):
     self.assertIn("source: activeSource", self.qml)
     watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
     self.assertRegex(watcher, r"if \(root\.demoMode\)[\s\S]*?else \{\s*root\.phase = \"idle\"")
+
+  def test_real_watcher_uses_native_setpriv_parent_death_handling(self) -> None:
+    watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
+    self.assertIn(
+      ': ["setpriv", "--pdeathsig", "TERM", "--", root.backendPath, "watch", "--source", root.activeSource]',
+      watcher,
+    )
+    helper = (ROOT / "lib/live_captions.py").read_text(encoding="utf-8")
+    self.assertNotIn("import ctypes", helper)
+    self.assertNotIn("prctl", helper)
+    self.assertNotIn("arm_parent_death_signal", helper)
 
   def test_stop_privacy_and_ipc_follow_the_process(self) -> None:
     self.assertIn('if (watchProcess.running) return sourceText + " session active', self.qml)
