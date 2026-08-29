@@ -21,11 +21,13 @@ The script checks:
 
 Unavailable platform-only tools are reported as skips, never as passes.
 
+GitHub Actions also runs an Arch container with `jq`, Quickshell, and Qt Declarative. That job checks the plugin with Omarchy's official validator and runs `qmllint` through a `qs` import tree against pinned Omarchy commit `945549699026df6c888a6b1bd4e06fbf55a67595`.
+
 ## Current v0.2 evidence
 
-The deterministic automated suite exercises the local HTTP protocol, real subprocess creation and cleanup, first-PCM readiness, pause boundaries, stale-backlog failure, bounded output, and event parsing. Its fake commands do not use PipeWire, a real Whisper model, or physical audio hardware.
+The deterministic automated suite exercises the local HTTP protocol, real subprocess creation and cleanup, the Linux `setpriv` parent-death boundary, first-PCM readiness, pause boundaries, stale-backlog failure, bounded output, and event parsing. Its fake commands do not use PipeWire, a real Whisper model, or physical audio hardware.
 
-No completed v0.2 Omarchy-hardware run is recorded in this repository. Microphone capture, desktop-monitor capture, multiple physical displays, observed end-to-caption latency, `qmllint` with Omarchy imports, and `omarchy plugin validate` remain separate environment-dependent gates. A validator skip is not evidence that a gate passed.
+No completed v0.2 Omarchy-hardware run is recorded in this repository. Microphone capture, desktop-monitor capture, multiple physical displays, observed end-to-caption latency, and loading the plugin in a running Omarchy session remain separate environment-dependent gates. The pinned CI contract does not substitute for those hardware checks.
 
 ## Safe desktop acceptance
 
@@ -38,13 +40,16 @@ bash scripts/acceptance-test.sh
 The default path summons deterministic demo captions. It must not open an audio device, launch `whisper-server`, or write audio/transcript data. Confirm:
 
 1. Caption cards appear on each connected display.
-2. The latest lines remain readable over dark and light content.
-3. Clicking outside the control card reaches the application beneath.
-4. Controls appear on the focused display.
-5. Text-size and top/bottom controls respond.
-6. The script polls until the first demo has a nonzero `segmentCount`, the requested source, and a still-running watcher.
-7. The script closes that active demo and polls IPC until it reports `open=false` and `running=false`; the invisible `keepLoaded` QML owner may remain resident without capture.
-8. A second demo completes naturally and reports `state=idle`, `running=false`, the requested source, and a nonzero `segmentCount`.
+2. Reposition a display or dock/undock while captions are open; caption and control surfaces remap to the displays' new origins instead of remaining off-screen.
+3. The latest lines remain readable over dark and light content.
+4. Clicking outside the control card reaches the application beneath.
+5. Controls appear on the focused display.
+6. On a short display or at a large interface scale, the control card stays on-screen and scrolls; Tab and Shift+Tab reveal every focused control. Enter and Space activate it; accessible names and radio-button state are announced.
+7. Escape closes the overlay, releases keyboard focus, and leaves the caption surfaces click-through.
+8. Text-size and top/bottom controls respond.
+9. The script polls until the first demo has a nonzero `segmentCount`, the requested source, and a still-running watcher.
+10. The script closes that active demo and polls IPC until it reports `open=false` and `running=false`; the invisible `keepLoaded` QML owner may remain resident without capture.
+11. A second demo completes naturally and reports `state=idle`, `running=false`, the requested source, and a nonzero `segmentCount`.
 
 Use `--screenshot` to save a fullscreen demo screenshot through Omarchy.
 

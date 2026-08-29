@@ -555,6 +555,21 @@ class LocalWhisperClientTests(unittest.TestCase):
 
 
 class CaptureReaderTests(unittest.TestCase):
+  def test_reports_stale_pending_audio_without_consuming_it(self) -> None:
+    reader = captions.CaptureReader(io.BytesIO(), threading.Event())
+    captured = captions.CapturedChunk(b"pending", 0, 10.0)
+    reader.queue.put(captured)
+    reader.queue.put(None)
+
+    self.assertFalse(
+      reader.pending_audio_is_stale(now=10.0 + captions.MAX_CAPTURE_BACKLOG_SECONDS)
+    )
+    self.assertTrue(
+      reader.pending_audio_is_stale(now=10.0 + captions.MAX_CAPTURE_BACKLOG_SECONDS + 0.001)
+    )
+    self.assertEqual(reader.queue.get_nowait(), captured)
+    self.assertIsNone(reader.queue.get_nowait())
+
   def test_queue_overflow_drops_oldest_without_blocking(self) -> None:
     reader = captions.CaptureReader(io.BytesIO(), threading.Event())
     reader.queue = queue.Queue(maxsize=2)
@@ -687,12 +702,10 @@ class DemoAndCliTests(unittest.TestCase):
       mock.patch.object(captions.sys, "stdout", output),
       mock.patch.object(captions, "platform_supported", side_effect=AssertionError("real platform queried")),
       mock.patch.object(captions, "discover_model", side_effect=AssertionError("model queried")),
-      mock.patch.object(captions, "arm_parent_death_signal") as arm_parent_death_signal,
       mock.patch.object(captions, "run_demo", return_value=0) as run_demo,
     ):
       self.assertEqual(captions.main(["watch", "--demo"]), 0)
     run_demo.assert_called_once()
-    arm_parent_death_signal.assert_called_once_with()
 
 
 class CleanupTests(unittest.TestCase):
@@ -785,7 +798,6 @@ class CleanupTests(unittest.TestCase):
         mock.patch.object(captions, "runtime_dir", return_value=Path(temporary)),
         mock.patch.object(captions, "SessionLease", return_value=lease),
         mock.patch.object(captions, "CaptionSession", return_value=session),
-        mock.patch.object(captions, "arm_parent_death_signal"),
         mock.patch.object(captions.signal, "getsignal", return_value=signal.SIG_DFL),
         mock.patch.object(captions.signal, "signal"),
       ):
@@ -839,7 +851,6 @@ class CleanupTests(unittest.TestCase):
         mock.patch.object(captions, "runtime_dir", return_value=Path(temporary)),
         mock.patch.object(captions, "SessionLease", return_value=lease),
         mock.patch.object(captions, "CaptionSession", return_value=session),
-        mock.patch.object(captions, "arm_parent_death_signal"),
         mock.patch.object(captions.signal, "getsignal", return_value=signal.SIG_DFL),
         mock.patch.object(captions.signal, "signal", restored),
         self.assertRaisesRegex(RuntimeError, "cleanup failed"),

@@ -42,7 +42,10 @@ fi
 if command -v qmllint >/dev/null 2>&1; then
   if [[ -n ${OMARCHY_PATH:-} && -d $OMARCHY_PATH/shell ]]; then
     say "==> qmllint"
-    qmllint -I "$OMARCHY_PATH/shell" LiveCaptions.qml
+    import_root="$(mktemp -d)"
+    trap 'rm -rf "$import_root"' EXIT
+    ln -s "$OMARCHY_PATH/shell" "$import_root/qs"
+    qmllint -I "$import_root" LiveCaptions.qml
   else
     say "SKIP: qmllint found, but OMARCHY_PATH/shell is unavailable"
   fi

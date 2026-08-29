@@ -119,6 +119,9 @@ class SessionRuntimeSafetyTests(unittest.TestCase):
     reader = mock.Mock()
     reader.queue = queue.Queue()
     reader.overflowed = threading.Event()
+    reader.pending_audio_is_stale.side_effect = (
+      lambda: captions.CaptureReader.pending_audio_is_stale(reader)
+    )
     session.reader = reader
     return session
 
@@ -170,6 +173,32 @@ class SessionRuntimeSafetyTests(unittest.TestCase):
 
     self.assertEqual(caught.exception.code, "capture-exited")
     self.assertIn("unexpectedly", caught.exception.message)
+
+  def test_no_caption_precedes_post_inference_capture_backlog(self) -> None:
+    session = self.bare_runtime_session()
+    sample_count = captions.WINDOW_BYTES // captions.SAMPLE_WIDTH
+    session.reader.queue.put(
+      captions.CapturedChunk(struct.pack("<h", 1000) * sample_count, 0, time.monotonic())
+    )
+
+    def finish_after_backlog(_wav: bytes, _language: str) -> str:
+      session.reader.queue.put(
+        captions.CapturedChunk(
+          b"pending pcm",
+          0,
+          time.monotonic() - captions.MAX_CAPTURE_BACKLOG_SECONDS - 1.0,
+        )
+      )
+      return "caption that is already stale"
+
+    session.client.transcribe.side_effect = finish_after_backlog
+
+    with self.assertRaises(captions.CaptionError) as caught:
+      session.run_caption_loop()
+
+    self.assertEqual(caught.exception.code, "capture-backlog")
+    events = [json.loads(line) for line in session.writer.stream.getvalue().splitlines()]
+    self.assertFalse(any(event.get("type") == "caption" for event in events))
 
   def test_pause_status_is_a_strict_boundary_for_caption_events(self) -> None:
     caption_started = threading.Event()
@@ -253,6 +282,9 @@ class SilenceGateTests(unittest.TestCase):
     reader = mock.Mock()
     reader.queue = StopAtEofQueue()
     reader.overflowed = threading.Event()
+    reader.pending_audio_is_stale.side_effect = (
+      lambda: captions.CaptureReader.pending_audio_is_stale(reader)
+    )
     sample_count = captions.WINDOW_BYTES // captions.SAMPLE_WIDTH
     reader.queue.put(
       captions.CapturedChunk(
@@ -279,6 +311,44 @@ class SilenceGateTests(unittest.TestCase):
     self.assertFalse(any(event.get("type") == "caption" for event in below_events))
     above_client.transcribe.assert_called_once()
     self.assertTrue(any(event.get("type") == "caption" for event in above_events))
+
+  def test_fully_silent_window_resets_spaced_and_cjk_overlap_history(self) -> None:
+    cases = (
+      ("Please call for help", "Please call for help again"),
+      ("你好世界", "你好世界再次"),
+    )
+    for first, after_silence in cases:
+      with self.subTest(after_silence=after_silence):
+        session = SessionRuntimeSafetyTests.bare_runtime_session()
+        session.client.transcribe.side_effect = [first, after_silence]
+
+        class StopAtEofQueue(queue.Queue):
+          def get(self, *args: object, **kwargs: object) -> object:
+            value = super().get(*args, **kwargs)
+            if value is None:
+              session.stop_event.set()
+            return value
+
+        session.reader.queue = StopAtEofQueue()
+        stride_bytes = captions.WINDOW_BYTES - captions.OVERLAP_BYTES
+        full_samples = captions.WINDOW_BYTES // captions.SAMPLE_WIDTH
+        stride_samples = stride_bytes // captions.SAMPLE_WIDTH
+        captured_at = time.monotonic()
+        session.reader.queue.put(
+          captions.CapturedChunk(struct.pack("<h", 100) * full_samples, 0, captured_at)
+        )
+        session.reader.queue.put(
+          captions.CapturedChunk(b"\0" * stride_bytes, 0, captured_at)
+        )
+        session.reader.queue.put(
+          captions.CapturedChunk(struct.pack("<h", 100) * stride_samples, 0, captured_at)
+        )
+        session.reader.queue.put(None)
+
+        self.assertEqual(session.run_caption_loop(), 0)
+        emitted = [json.loads(line) for line in session.writer.stream.getvalue().splitlines()]
+        events = [event for event in emitted if event.get("type") == "caption"]
+        self.assertEqual([event["text"] for event in events], [first, after_silence])
 
 
 if __name__ == "__main__":

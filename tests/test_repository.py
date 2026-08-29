@@ -38,6 +38,23 @@ class ManifestTests(unittest.TestCase):
     ]
     self.assertEqual(symlinks, [])
 
+  def test_ci_pins_actions_and_runs_arch_omarchy_contract(self) -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    revisions = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", workflow)
+    self.assertGreaterEqual(len(revisions), 5)
+    for revision in revisions:
+      self.assertRegex(revision, r"^[0-9a-f]{40}$")
+    for contract in (
+      'python-version: ["3.12", "3.14"]',
+      "container: archlinux:latest",
+      "git jq quickshell qt6-declarative",
+      "omarchy-plugin-validate",
+      'ln -s "$OMARCHY_PATH/shell" "$RUNNER_TEMP/live-captions-qml/qs"',
+      "/usr/lib/qt6/bin/qmllint",
+      "945549699026df6c888a6b1bd4e06fbf55a67595",
+    ):
+      self.assertIn(contract, workflow)
+
 
 class QmlSafetyTests(unittest.TestCase):
   @classmethod
@@ -51,10 +68,73 @@ class QmlSafetyTests(unittest.TestCase):
       self.assertNotRegex(self.qml, rf"required\s+property\s+\w+\s+{name}\b")
 
   def test_caption_surface_is_click_through(self) -> None:
-    self.assertIn('WlrLayershell.namespace: "live-captions-text"', self.qml)
-    self.assertRegex(self.qml, r"mask:\s*Region\s*\{\s*\}")
-    self.assertIn("WlrKeyboardFocus.None", self.qml)
-    self.assertIn("ExclusionMode.Ignore", self.qml)
+    caption_surface = self.qml[
+      self.qml.index("PanelWindow {\n      id: captionWindow")
+      : self.qml.index("// One small interactive card")
+    ]
+    self.assertIn('WlrLayershell.namespace: "live-captions-text"', caption_surface)
+    self.assertRegex(caption_surface, r"mask:\s*Region\s*\{\s*\}")
+    self.assertIn("WlrKeyboardFocus.None", caption_surface)
+    self.assertIn("ExclusionMode.Ignore", caption_surface)
+    self.assertNotIn("AccessButton", caption_surface)
+
+  def test_caption_surface_stays_screen_safe_and_keeps_newest_blocks_visible(self) -> None:
+    caption_surface = self.qml[
+      self.qml.index("PanelWindow {\n      id: captionWindow")
+      : self.qml.index("// One small interactive card")
+    ]
+    for contract in (
+      "Math.min(Style.space(900), captionWindow.width - Style.space(48))",
+      "Math.min(desiredHeight, captionWindow.height - Style.space(64))",
+      "id: captionViewport",
+      "clip: true",
+      "captionViewport.height - implicitHeight",
+    ):
+      self.assertIn(contract, caption_surface)
+    self.assertNotIn("Math.max(Style.space(300)", caption_surface)
+    self.assertIn('text: "Caption blocks"', self.qml)
+    self.assertIn('Accessible.name: "Show fewer caption blocks"', self.qml)
+    self.assertIn('Accessible.name: "Show more caption blocks"', self.qml)
+
+  def test_long_lived_surfaces_use_omarchy_screen_move_remapping(self) -> None:
+    self.assertEqual(self.qml.count("ScreenMoveRemap {"), 2)
+    self.assertIn("visible: root.captionSurfaceVisible && !captionRemapGuard.remapping", self.qml)
+    self.assertIn("visible: root.opened && root.controlScreen !== null && !controlRemapGuard.remapping", self.qml)
+    self.assertIn("window: captionWindow", self.qml)
+    self.assertIn("window: controlWindow", self.qml)
+
+  def test_control_surface_uses_omarchy_keyboard_focus_lifecycle(self) -> None:
+    controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
+    self.assertIn("WlrKeyboardFocus.Exclusive", controls)
+    self.assertIn("WlrKeyboardFocus.OnDemand", controls)
+    self.assertIn("WlrKeyboardFocus.None", controls)
+    self.assertIn("interval: 75", controls)
+    self.assertIn("expandButton.forceActiveFocus()", self.qml)
+    self.assertIn("controlWindow.primeKeyboardFocus()", self.qml)
+    self.assertIn("Keys.onEscapePressed", controls)
+    self.assertIn("mask: Region { item: controlCard }", controls)
+
+  def test_control_card_is_bounded_scrollable_and_keeps_focus_visible(self) -> None:
+    controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
+    self.assertIn("controlWindow.height - Style.space(32)", controls)
+    self.assertIn("id: controlViewport", controls)
+    self.assertIn("contentHeight: controlColumn.implicitHeight", controls)
+    self.assertIn("boundsBehavior: Flickable.StopAtBounds", controls)
+    self.assertIn("Controls.ScrollBar.vertical", controls)
+    self.assertIn("function revealControl(item)", self.qml)
+    self.assertIn("item.mapToItem(controlViewport.contentItem, 0, 0)", self.qml)
+    self.assertIn("Qt.callLater(function() { root.revealControl(accessButton) })", self.qml)
+    self.assertIn("onImplicitHeightChanged:", controls)
+    self.assertIn("root.focusedControl.activeFocus", controls)
+
+  def test_every_control_button_is_keyboard_and_at_accessible(self) -> None:
+    controls = self.qml[self.qml.index('WlrLayershell.namespace: "live-captions-controls"') :]
+    self.assertNotRegex(controls, r"(?m)^\s+Button\s*\{")
+    self.assertEqual(controls.count("AccessButton {"), 16)
+    self.assertIn("focusable: true", self.qml)
+    self.assertIn("Accessible.onPressAction", self.qml)
+    self.assertIn("Accessible.role: Accessible.Dialog", controls)
+    self.assertGreaterEqual(controls.count("Accessible.role: Accessible.RadioButton"), 4)
 
   def test_close_stops_the_owned_qml_process_directly(self) -> None:
     close_body = self.qml[self.qml.index("function close()") : self.qml.index("function dismiss()")]
@@ -134,6 +214,17 @@ class QmlSafetyTests(unittest.TestCase):
     self.assertIn("source: activeSource", self.qml)
     watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
     self.assertRegex(watcher, r"if \(root\.demoMode\)[\s\S]*?else \{\s*root\.phase = \"idle\"")
+
+  def test_real_watcher_uses_native_setpriv_parent_death_handling(self) -> None:
+    watcher = self.qml[self.qml.index("Process {\n    id: watchProcess") : self.qml.index("IpcHandler {")]
+    self.assertIn(
+      ': ["setpriv", "--pdeathsig", "TERM", "--", root.backendPath, "watch", "--source", root.activeSource]',
+      watcher,
+    )
+    helper = (ROOT / "lib/live_captions.py").read_text(encoding="utf-8")
+    self.assertNotIn("import ctypes", helper)
+    self.assertNotIn("prctl", helper)
+    self.assertNotIn("arm_parent_death_signal", helper)
 
   def test_stop_privacy_and_ipc_follow_the_process(self) -> None:
     self.assertIn('if (watchProcess.running) return sourceText + " session active', self.qml)

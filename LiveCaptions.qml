@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Hyprland
@@ -46,6 +47,7 @@ Item {
   property bool watchStartPending: false
   property bool reopenPending: false
   property string reopenPayload: ""
+  property var focusedControl: null
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id)
@@ -93,12 +95,43 @@ Item {
     return screens[0]
   }
 
+  component AccessButton: Button {
+    id: accessButton
+    focusable: true
+    Accessible.role: Accessible.Button
+    Accessible.name: text
+    Accessible.focusable: enabled && visible
+    Accessible.focused: activeFocus
+    Accessible.onPressAction: if (enabled) clicked()
+    onActiveFocusChanged: {
+      if (!activeFocus) return
+      root.focusedControl = accessButton
+      Qt.callLater(function() { root.revealControl(accessButton) })
+    }
+  }
+
+  function revealControl(item) {
+    if (!item || !controlViewport || controlViewport.height <= 0) return
+    var point = item.mapToItem(controlViewport.contentItem, 0, 0)
+    var margin = Style.space(6)
+    var top = point.y
+    var bottom = top + item.height
+    var viewTop = controlViewport.contentY
+    var viewBottom = viewTop + controlViewport.height
+    var maxY = Math.max(0, controlViewport.contentHeight - controlViewport.height)
+    if (top < viewTop + margin)
+      controlViewport.contentY = Math.max(0, Math.min(maxY, top - margin))
+    else if (bottom > viewBottom - margin)
+      controlViewport.contentY = Math.max(0, Math.min(maxY, bottom + margin - controlViewport.height))
+  }
+
   function open(payloadJson) {
     var options = CaptionModel.parsePayload(payloadJson)
     if (opened && (doctorProcess.running || watchProcess.running || activeState)) {
       // A second summon reveals controls, but it must never swap an audio
       // source or turn a real capture into a demo mid-session.
       controlsExpanded = true
+      controlWindow.primeKeyboardFocus()
       return
     }
     if (!opened && (doctorProcess.running || watchProcess.running || doctorExpectedStop || explicitStop)) {
@@ -134,6 +167,7 @@ Item {
     explicitStop = false
     phase = demoMode ? "starting" : "checking"
     opened = true
+    controlWindow.primeKeyboardFocus()
 
     if (demoMode) {
       Qt.callLater(function() {
@@ -360,7 +394,7 @@ Item {
     stdinEnabled: true
     command: root.demoMode
       ? [root.backendPath, "watch", "--demo", "--source", root.activeSource]
-      : [root.backendPath, "watch", "--source", root.activeSource]
+      : ["setpriv", "--pdeathsig", "TERM", "--", root.backendPath, "watch", "--source", root.activeSource]
     stdout: SplitParser {
       onRead: function(line) { root.applyEvent(CaptionModel.parseEvent(line)) }
     }
@@ -479,8 +513,14 @@ Item {
       id: captionWindow
       required property var modelData
       screen: modelData
-      visible: root.captionSurfaceVisible
+      visible: root.captionSurfaceVisible && !captionRemapGuard.remapping
       anchors { top: true; right: true; bottom: true; left: true }
+
+      ScreenMoveRemap {
+        id: captionRemapGuard
+        window: captionWindow
+      }
+
       color: "transparent"
       exclusionMode: ExclusionMode.Ignore
       WlrLayershell.namespace: "live-captions-text"
@@ -491,8 +531,9 @@ Item {
       BorderSurface {
         id: captionCard
         visible: root.captionSurfaceVisible
-        width: Math.min(Style.space(900), Math.max(Style.space(300), captionWindow.width - Style.space(48)))
-        height: captionColumn.implicitHeight + Style.space(28) + borderTop + borderBottom
+        readonly property real desiredHeight: captionColumn.implicitHeight + Style.space(28) + borderTop + borderBottom
+        width: Math.max(Style.space(1), Math.min(Style.space(900), captionWindow.width - Style.space(48)))
+        height: Math.max(Style.space(1), Math.min(desiredHeight, captionWindow.height - Style.space(64)))
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top: root.captionPosition === "top" ? parent.top : undefined
         anchors.bottom: root.captionPosition === "bottom" ? parent.bottom : undefined
@@ -502,76 +543,85 @@ Item {
         borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
         radius: Style.cornerRadius
 
-        Column {
-          id: captionColumn
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
+        Item {
+          id: captionViewport
+          anchors.fill: parent
           anchors.leftMargin: captionCard.borderLeft + Style.space(18)
           anchors.rightMargin: captionCard.borderRight + Style.space(18)
-          spacing: Style.space(8)
+          anchors.topMargin: captionCard.borderTop + Style.space(14)
+          anchors.bottomMargin: captionCard.borderBottom + Style.space(14)
+          clip: true
 
-          Row {
+          Column {
+            id: captionColumn
+            width: captionViewport.width
+            y: implicitHeight <= captionViewport.height
+              ? (captionViewport.height - implicitHeight) / 2
+              : captionViewport.height - implicitHeight
             spacing: Style.space(8)
-            Rectangle {
-              width: Style.space(8)
-              height: width
-              radius: width / 2
-              anchors.verticalCenter: parent.verticalCenter
-              color: root.statusColor
-            }
-            Text {
-              text: root.statusText + " · " + root.sourceText
-              color: Util.alpha(Color.popups.text, 0.76)
-              font.family: Style.font.family
-              font.pixelSize: Math.round(Style.font.caption * root.fontScale)
-              font.bold: true
-            }
-          }
 
-          Text {
-            visible: root.visibleSegments.length === 0
-            width: parent.width
-            text: root.phase === "paused"
-              ? "Captions paused"
-              : "Listening… the first caption appears after a short local audio chunk."
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Math.round(Style.font.title * root.fontScale)
-            font.bold: true
-            wrapMode: Text.WordWrap
-            horizontalAlignment: Text.AlignHCenter
-          }
-
-          Repeater {
-            model: root.visibleSegments
-
-            delegate: Column {
-              required property var modelData
-              required property int index
-              width: captionColumn.width
-              spacing: Style.space(2)
-              opacity: index === root.visibleSegments.length - 1 ? 1 : 0.72
-
-              Text {
-                text: CaptionModel.speakerLabel(modelData)
-                textFormat: Text.PlainText
+            Row {
+              spacing: Style.space(8)
+              Rectangle {
+                width: Style.space(8)
+                height: width
+                radius: width / 2
+                anchors.verticalCenter: parent.verticalCenter
                 color: root.statusColor
+              }
+              Text {
+                text: root.statusText + " · " + root.sourceText
+                color: Util.alpha(Color.popups.text, 0.76)
                 font.family: Style.font.family
                 font.pixelSize: Math.round(Style.font.caption * root.fontScale)
                 font.bold: true
               }
-              Text {
-                width: parent.width
-                text: modelData.text
-                textFormat: Text.PlainText
-                color: Color.popups.text
-                font.family: Style.font.family
-                font.pixelSize: Math.round(Style.font.title * root.fontScale)
-                font.bold: index === root.visibleSegments.length - 1
-                wrapMode: Text.WordWrap
-                maximumLineCount: 3
-                elide: Text.ElideRight
+            }
+
+            Text {
+              visible: root.visibleSegments.length === 0
+              width: parent.width
+              text: root.phase === "paused"
+                ? "Captions paused"
+                : "Listening… the first caption appears after a short local audio chunk."
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Math.round(Style.font.title * root.fontScale)
+              font.bold: true
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Repeater {
+              model: root.visibleSegments
+
+              delegate: Column {
+                required property var modelData
+                required property int index
+                width: captionColumn.width
+                spacing: Style.space(2)
+                opacity: index === root.visibleSegments.length - 1 ? 1 : 0.72
+
+                Text {
+                  text: CaptionModel.speakerLabel(modelData)
+                  textFormat: Text.PlainText
+                  color: root.statusColor
+                  font.family: Style.font.family
+                  font.pixelSize: Math.round(Style.font.caption * root.fontScale)
+                  font.bold: true
+                }
+                Text {
+                  width: parent.width
+                  text: modelData.text
+                  textFormat: Text.PlainText
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Math.round(Style.font.title * root.fontScale)
+                  font.bold: index === root.visibleSegments.length - 1
+                  wrapMode: Text.WordWrap
+                  maximumLineCount: 3
+                  elide: Text.ElideRight
+                }
               }
             }
           }
@@ -585,20 +635,70 @@ Item {
   // click-through just like the caption surfaces above.
   PanelWindow {
     id: controlWindow
+    property bool focusPrimed: false
+
+    function primeKeyboardFocus() {
+      if (!root.opened || !visible) return
+      focusPrimed = false
+      focusPrimeTimer.restart()
+      Qt.callLater(function() {
+        if (root.opened && controlWindow.visible) expandButton.forceActiveFocus()
+      })
+    }
+
     screen: root.controlScreen
-    visible: root.opened && root.controlScreen !== null
+    visible: root.opened && root.controlScreen !== null && !controlRemapGuard.remapping
     anchors { top: true; right: true; bottom: true; left: true }
+
+    ScreenMoveRemap {
+      id: controlRemapGuard
+      window: controlWindow
+    }
+
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.namespace: "live-captions-controls"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    // Match Omarchy's KeyboardPanel contract: briefly acquire focus on map,
+    // then settle to OnDemand so other outputs keep normal pointer routing.
+    // Closing releases keyboard ownership immediately, before process cleanup.
+    WlrLayershell.keyboardFocus: root.opened && visible
+      ? (focusPrimed ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.Exclusive)
+      : WlrKeyboardFocus.None
     mask: Region { item: controlCard }
+
+    onVisibleChanged: {
+      if (visible) primeKeyboardFocus()
+      else focusPrimeTimer.stop()
+    }
+
+    Connections {
+      target: root
+      function onOpenedChanged() {
+        if (root.opened) controlWindow.primeKeyboardFocus()
+        else {
+          focusPrimeTimer.stop()
+          controlWindow.focusPrimed = false
+        }
+      }
+    }
+
+    Timer {
+      id: focusPrimeTimer
+      interval: 75
+      onTriggered: if (root.opened) controlWindow.focusPrimed = true
+    }
 
     BorderSurface {
       id: controlCard
       width: Math.min(root.controlsExpanded ? Style.space(410) : Style.space(285), controlWindow.width - Style.space(32))
-      height: controlColumn.implicitHeight + Style.space(24) + borderTop + borderBottom
+      height: Math.max(
+        Style.space(1),
+        Math.min(
+          controlColumn.implicitHeight + Style.space(24) + borderTop + borderBottom,
+          controlWindow.height - Style.space(32)
+        )
+      )
       anchors.right: parent.right
       anchors.rightMargin: Style.space(16)
       anchors.top: root.captionPosition === "bottom" ? parent.top : undefined
@@ -608,377 +708,454 @@ Item {
       color: Util.alpha(Color.popups.background, 0.97)
       borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
+      Accessible.role: Accessible.Dialog
+      Accessible.name: "Live Captions controls"
+      Keys.onEscapePressed: function(event) {
+        root.dismiss()
+        event.accepted = true
+      }
 
-      Column {
-        id: controlColumn
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
+      Flickable {
+        id: controlViewport
+        anchors.fill: parent
         anchors.leftMargin: controlCard.borderLeft + Style.space(12)
         anchors.rightMargin: controlCard.borderRight + Style.space(12)
-        spacing: Style.space(10)
-
-        RowLayout {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Rectangle {
-            Layout.alignment: Qt.AlignVCenter
-            width: Style.space(9)
-            height: width
-            radius: width / 2
-            color: root.statusColor
-          }
-          Column {
-            Layout.fillWidth: true
-            spacing: 0
-            Text {
-              text: "Live Captions"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.subtitle
-              font.bold: true
-            }
-            Text {
-              text: root.statusText + (root.activeState && !root.demoMode ? " · " + CaptionModel.formatElapsed(root.elapsedSeconds) : "")
-              color: Util.alpha(Color.popups.text, 0.68)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-          }
-          Button {
-            text: root.controlsExpanded ? "Less" : "More"
-            foreground: Color.popups.text
-            fontSize: Style.font.caption
-            horizontalPadding: Style.space(7)
-            verticalPadding: Style.space(5)
-            tooltipText: root.controlsExpanded ? "Collapse controls" : "Expand controls"
-            onClicked: root.controlsExpanded = !root.controlsExpanded
-          }
-          Button {
-            text: "Close"
-            foreground: Color.popups.text
-            fontSize: Style.font.caption
-            horizontalPadding: Style.space(7)
-            verticalPadding: Style.space(5)
-            tooltipText: "Close and stop any active capture"
-            onClicked: root.dismiss()
-          }
-        }
+        anchors.topMargin: controlCard.borderTop + Style.space(12)
+        anchors.bottomMargin: controlCard.borderBottom + Style.space(12)
+        contentWidth: width
+        contentHeight: controlColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        Controls.ScrollBar.vertical: Controls.ScrollBar { policy: Controls.ScrollBar.AsNeeded }
 
         Column {
-          visible: root.controlsExpanded
-          width: parent.width
+          id: controlColumn
+          width: controlViewport.width
           spacing: Style.space(10)
-
-          Text {
-            width: parent.width
-            text: root.privacyText
-            color: Util.alpha(Color.popups.text, 0.72)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
+          onImplicitHeightChanged: {
+            if (!root.focusedControl || !root.focusedControl.activeFocus) return
+            Qt.callLater(function() { root.revealControl(root.focusedControl) })
           }
 
-          Column {
-            visible: !root.demoMode && root.doctorSeen && !root.doctorReady
-            width: parent.width
-            spacing: Style.space(7)
-
-            Text {
-              text: "Local setup needed"
-              color: Color.urgent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.subtitle
-              font.bold: true
-            }
-            Text {
-              width: parent.width
-              text: root.setupDetails
-              textFormat: Text.PlainText
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.WordWrap
-            }
-            Text {
-              width: parent.width
-              text: "The helper also discovers compatible models already downloaded by VoxType. Choose Check again after installing dependencies."
-              color: Util.alpha(Color.popups.text, 0.64)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-            Row {
-              spacing: Style.space(8)
-
-              Button {
-                text: root.doctorSeen ? "Check again" : "Checking…"
-                iconText: "↻"
-                enabled: root.doctorSeen && !doctorProcess.running
-                foreground: Color.popups.text
-                bordered: true
-                onClicked: root.retryDoctor()
-              }
-              Button {
-                text: "Try demo"
-                iconText: "▶"
-                enabled: !doctorProcess.running && !watchProcess.running
-                foreground: Color.popups.text
-                accent: Color.accent
-                bordered: true
-                onClicked: root.open(JSON.stringify({
-                  demo: true,
-                  source: root.selectedSource,
-                  fontScale: root.fontScale,
-                  maxRows: root.maxRows,
-                  position: root.captionPosition
-                }))
-              }
-            }
-          }
-
-          Text {
-            visible: !root.demoMode && !root.doctorSeen
-            width: parent.width
-            text: "Checking the local caption engine…"
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Column {
-            visible: root.demoMode || root.doctorReady
+          RowLayout {
             width: parent.width
             spacing: Style.space(8)
 
+            Rectangle {
+              Layout.alignment: Qt.AlignVCenter
+              width: Style.space(9)
+              height: width
+              radius: width / 2
+              color: root.statusColor
+            }
+            Column {
+              Layout.fillWidth: true
+              spacing: 0
+              Text {
+                text: "Live Captions"
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+              }
+              Text {
+                text: root.statusText + (root.activeState && !root.demoMode ? " · " + CaptionModel.formatElapsed(root.elapsedSeconds) : "")
+                color: Util.alpha(Color.popups.text, 0.68)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Accessible.role: Accessible.StatusBar
+                Accessible.name: text
+              }
+            }
+            AccessButton {
+              id: expandButton
+              text: root.controlsExpanded ? "Less" : "More"
+              foreground: Color.popups.text
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(7)
+              verticalPadding: Style.space(5)
+              tooltipText: root.controlsExpanded ? "Collapse controls" : "Expand controls"
+              Accessible.name: root.controlsExpanded
+                ? "Collapse Live Captions controls"
+                : "Expand Live Captions controls"
+              onClicked: root.controlsExpanded = !root.controlsExpanded
+            }
+            AccessButton {
+              text: "Close"
+              foreground: Color.popups.text
+              fontSize: Style.font.caption
+              horizontalPadding: Style.space(7)
+              verticalPadding: Style.space(5)
+              tooltipText: "Close and stop any active capture"
+              Accessible.name: "Close Live Captions and stop capture"
+              Accessible.description: tooltipText
+              onClicked: root.dismiss()
+            }
+          }
+
+          Column {
+            visible: root.controlsExpanded
+            width: parent.width
+            spacing: Style.space(10)
+
             Text {
-              visible: !root.demoMode
-              text: "Audio source"
+              width: parent.width
+              text: root.privacyText
+              color: Util.alpha(Color.popups.text, 0.72)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+              Accessible.role: Accessible.StaticText
+              Accessible.name: text
+            }
+
+            Column {
+              visible: !root.demoMode && root.doctorSeen && !root.doctorReady
+              width: parent.width
+              spacing: Style.space(7)
+
+              Text {
+                text: "Local setup needed"
+                color: Color.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+              }
+              Text {
+                width: parent.width
+                text: root.setupDetails
+                textFormat: Text.PlainText
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+              Text {
+                width: parent.width
+                text: "The helper also discovers compatible models already downloaded by VoxType. Choose Check again after installing dependencies."
+                color: Util.alpha(Color.popups.text, 0.64)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Row {
+                spacing: Style.space(8)
+
+                AccessButton {
+                  text: root.doctorSeen ? "Check again" : "Checking…"
+                  iconText: "↻"
+                  enabled: root.doctorSeen && !doctorProcess.running
+                  foreground: Color.popups.text
+                  bordered: true
+                  Accessible.name: "Check local caption setup again"
+                  onClicked: root.retryDoctor()
+                }
+                AccessButton {
+                  text: "Try demo"
+                  iconText: "▶"
+                  enabled: !doctorProcess.running && !watchProcess.running
+                  foreground: Color.popups.text
+                  accent: Color.accent
+                  bordered: true
+                  Accessible.name: "Try Live Captions demo"
+                  Accessible.description: "Starts synthetic captions without opening an audio device"
+                  onClicked: root.open(JSON.stringify({
+                    demo: true,
+                    source: root.selectedSource,
+                    fontScale: root.fontScale,
+                    maxRows: root.maxRows,
+                    position: root.captionPosition
+                  }))
+                }
+              }
+            }
+
+            Text {
+              visible: !root.demoMode && !root.doctorSeen
+              width: parent.width
+              text: "Checking the local caption engine…"
+              color: Color.popups.text
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+              Accessible.role: Accessible.StatusBar
+              Accessible.name: text
+            }
+
+            Column {
+              visible: root.demoMode || root.doctorReady
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                visible: !root.demoMode
+                text: "Audio source"
+                color: Util.alpha(Color.popups.text, 0.68)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+              }
+              Row {
+                visible: !root.demoMode
+                spacing: Style.space(8)
+                AccessButton {
+                  text: "Microphone"
+                  selected: root.selectedSource === "microphone"
+                  enabled: !root.activeState && !watchProcess.running
+                  foreground: Color.popups.text
+                  accent: Color.accent
+                  bordered: true
+                  Accessible.role: Accessible.RadioButton
+                  Accessible.name: "Microphone audio source"
+                  Accessible.checkable: true
+                  Accessible.checked: selected
+                  onClicked: root.selectedSource = "microphone"
+                }
+                AccessButton {
+                  text: "Desktop audio"
+                  selected: root.selectedSource === "desktop"
+                  enabled: !root.activeState && !watchProcess.running
+                  foreground: Color.popups.text
+                  accent: Color.accent
+                  bordered: true
+                  Accessible.role: Accessible.RadioButton
+                  Accessible.name: "Desktop audio source"
+                  Accessible.checkable: true
+                  Accessible.checked: selected
+                  onClicked: root.selectedSource = "desktop"
+                }
+              }
+
+              Row {
+                spacing: Style.space(8)
+
+                AccessButton {
+                  visible: !root.demoMode && (root.phase === "idle" || root.phase === "error")
+                  text: "Start captions"
+                  iconText: "●"
+                  enabled: root.doctorReady && !watchProcess.running
+                  foreground: Color.popups.text
+                  accent: Color.accent
+                  bordered: true
+                  Accessible.name: "Start live captions"
+                  onClicked: root.beginCaptions()
+                }
+                AccessButton {
+                  visible: !root.demoMode && (root.phase === "listening" || root.phase === "recording")
+                  text: "Pause"
+                  iconText: "Ⅱ"
+                  enabled: watchProcess.running
+                  foreground: Color.popups.text
+                  bordered: true
+                  Accessible.name: "Pause live captions"
+                  onClicked: root.runAction("pause")
+                }
+                AccessButton {
+                  visible: !root.demoMode && root.phase === "paused"
+                  text: "Resume"
+                  iconText: "▶"
+                  enabled: watchProcess.running
+                  foreground: Color.popups.text
+                  bordered: true
+                  Accessible.name: "Resume live captions"
+                  onClicked: root.runAction("resume")
+                }
+                AccessButton {
+                  visible: !root.demoMode && watchProcess.running
+                  text: root.phase === "stopping" ? "Stopping…" : "Stop"
+                  iconText: "■"
+                  enabled: watchProcess.running && root.phase !== "stopping"
+                  foreground: Color.urgent
+                  accent: Color.urgent
+                  bordered: true
+                  Accessible.name: root.phase === "stopping"
+                    ? "Stopping live captions"
+                    : "Stop live captions"
+                  onClicked: root.runAction("stop")
+                }
+                Text {
+                  visible: root.demoMode
+                  text: "Preview mode — no audio capture"
+                  color: Color.popups.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              Rectangle {
+                visible: !root.demoMode && watchProcess.running
+                width: parent.width
+                height: Style.space(4)
+                radius: height / 2
+                color: Util.alpha(Color.popups.text, 0.16)
+
+                Rectangle {
+                  width: parent.width * CaptionModel.clamp(root.inputLevel, 0, 1)
+                  height: parent.height
+                  radius: parent.radius
+                  color: root.statusColor
+                  Behavior on width { NumberAnimation { duration: 90 } }
+                }
+              }
+            }
+
+            Text {
+              visible: root.errorMessage !== ""
+              width: parent.width
+              text: root.errorMessage
+              textFormat: Text.PlainText
+              color: Color.urgent
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+              Accessible.role: Accessible.AlertMessage
+              Accessible.name: text
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Math.max(1, Style.space(1))
+              color: Util.alpha(Color.popups.text, 0.14)
+            }
+
+            Text {
+              text: "Caption accessibility"
               color: Util.alpha(Color.popups.text, 0.68)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               font.bold: true
-            }
-            Row {
-              visible: !root.demoMode
-              spacing: Style.space(8)
-              Button {
-                text: "Microphone"
-                selected: root.selectedSource === "microphone"
-                enabled: !root.activeState && !watchProcess.running
-                foreground: Color.popups.text
-                accent: Color.accent
-                bordered: true
-                onClicked: root.selectedSource = "microphone"
-              }
-              Button {
-                text: "Desktop audio"
-                selected: root.selectedSource === "desktop"
-                enabled: !root.activeState && !watchProcess.running
-                foreground: Color.popups.text
-                accent: Color.accent
-                bordered: true
-                onClicked: root.selectedSource = "desktop"
-              }
+              Accessible.role: Accessible.Heading
+              Accessible.name: text
             }
 
-            Row {
-              spacing: Style.space(8)
-
-              Button {
-                visible: !root.demoMode && (root.phase === "idle" || root.phase === "error")
-                text: "Start captions"
-                iconText: "●"
-                enabled: root.doctorReady && !watchProcess.running
-                foreground: Color.popups.text
-                accent: Color.accent
-                bordered: true
-                onClicked: root.beginCaptions()
-              }
-              Button {
-                visible: !root.demoMode && (root.phase === "listening" || root.phase === "recording")
-                text: "Pause"
-                iconText: "Ⅱ"
-                enabled: watchProcess.running
-                foreground: Color.popups.text
-                bordered: true
-                onClicked: root.runAction("pause")
-              }
-              Button {
-                visible: !root.demoMode && root.phase === "paused"
-                text: "Resume"
-                iconText: "▶"
-                enabled: watchProcess.running
-                foreground: Color.popups.text
-                bordered: true
-                onClicked: root.runAction("resume")
-              }
-              Button {
-                visible: !root.demoMode && watchProcess.running
-                text: root.phase === "stopping" ? "Stopping…" : "Stop"
-                iconText: "■"
-                enabled: watchProcess.running && root.phase !== "stopping"
-                foreground: Color.urgent
-                accent: Color.urgent
-                bordered: true
-                onClicked: root.runAction("stop")
-              }
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(6)
               Text {
-                visible: root.demoMode
-                text: "Preview mode — no audio capture"
+                Layout.fillWidth: true
+                text: "Text size"
                 color: Color.popups.text
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
-                font.bold: true
-                anchors.verticalCenter: parent.verticalCenter
+              }
+              AccessButton {
+                text: "A−"
+                enabled: root.fontScale > 0.8
+                foreground: Color.popups.text
+                bordered: true
+                Accessible.name: "Decrease caption text size"
+                Accessible.description: "Current size " + Math.round(root.fontScale * 100) + " percent"
+                onClicked: root.fontScale = CaptionModel.clamp(root.fontScale - 0.1, 0.8, 1.8)
+              }
+              Text {
+                text: Math.round(root.fontScale * 100) + "%"
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              AccessButton {
+                text: "A+"
+                enabled: root.fontScale < 1.8
+                foreground: Color.popups.text
+                bordered: true
+                Accessible.name: "Increase caption text size"
+                Accessible.description: "Current size " + Math.round(root.fontScale * 100) + " percent"
+                onClicked: root.fontScale = CaptionModel.clamp(root.fontScale + 0.1, 0.8, 1.8)
               }
             }
 
-            Rectangle {
-              visible: !root.demoMode && watchProcess.running
+            RowLayout {
               width: parent.width
-              height: Style.space(4)
-              radius: height / 2
-              color: Util.alpha(Color.popups.text, 0.16)
-
-              Rectangle {
-                width: parent.width * CaptionModel.clamp(root.inputLevel, 0, 1)
-                height: parent.height
-                radius: parent.radius
-                color: root.statusColor
-                Behavior on width { NumberAnimation { duration: 90 } }
+              spacing: Style.space(6)
+              Text {
+                Layout.fillWidth: true
+                text: "Caption blocks"
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              AccessButton {
+                text: "−"
+                enabled: root.maxRows > 1
+                foreground: Color.popups.text
+                bordered: true
+                Accessible.name: "Show fewer caption blocks"
+                Accessible.description: "Currently showing " + root.maxRows + " caption blocks"
+                onClicked: root.maxRows = Math.max(1, root.maxRows - 1)
+              }
+              Text {
+                text: String(root.maxRows)
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              AccessButton {
+                text: "+"
+                enabled: root.maxRows < 5
+                foreground: Color.popups.text
+                bordered: true
+                Accessible.name: "Show more caption blocks"
+                Accessible.description: "Currently showing " + root.maxRows + " caption blocks"
+                onClicked: root.maxRows = Math.min(5, root.maxRows + 1)
               }
             }
-          }
 
-          Text {
-            visible: root.errorMessage !== ""
-            width: parent.width
-            text: root.errorMessage
-            textFormat: Text.PlainText
-            color: Color.urgent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(6)
+              Text {
+                Layout.fillWidth: true
+                text: "Placement"
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              AccessButton {
+                text: "Top"
+                selected: root.captionPosition === "top"
+                foreground: Color.popups.text
+                accent: Color.accent
+                bordered: true
+                Accessible.role: Accessible.RadioButton
+                Accessible.name: "Place captions at top"
+                Accessible.checkable: true
+                Accessible.checked: selected
+                onClicked: root.captionPosition = "top"
+              }
+              AccessButton {
+                text: "Bottom"
+                selected: root.captionPosition === "bottom"
+                foreground: Color.popups.text
+                accent: Color.accent
+                bordered: true
+                Accessible.role: Accessible.RadioButton
+                Accessible.name: "Place captions at bottom"
+                Accessible.checkable: true
+                Accessible.checked: selected
+                onClicked: root.captionPosition = "bottom"
+              }
+            }
 
-          Rectangle {
-            width: parent.width
-            height: Math.max(1, Style.space(1))
-            color: Util.alpha(Color.popups.text, 0.14)
-          }
-
-          Text {
-            text: "Caption accessibility"
-            color: Util.alpha(Color.popups.text, 0.68)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            font.bold: true
-          }
-
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
             Text {
-              Layout.fillWidth: true
-              text: "Text size"
-              color: Color.popups.text
+              visible: root.activeState && !root.demoMode
+              width: parent.width
+              text: "Final captions appear after each local inference chunk"
+                + (root.lastLatencyMs > 0 ? " · estimate " + root.lastLatencyMs + " ms" : "")
+              color: Util.alpha(Color.popups.text, 0.58)
               font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
-            Button {
-              text: "A−"
-              enabled: root.fontScale > 0.8
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.fontScale = CaptionModel.clamp(root.fontScale - 0.1, 0.8, 1.8)
-            }
-            Text {
-              text: Math.round(root.fontScale * 100) + "%"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-            }
-            Button {
-              text: "A+"
-              enabled: root.fontScale < 1.8
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.fontScale = CaptionModel.clamp(root.fontScale + 0.1, 0.8, 1.8)
-            }
-          }
-
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
-            Text {
-              Layout.fillWidth: true
-              text: "Lines shown"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-            }
-            Button {
-              text: "−"
-              enabled: root.maxRows > 1
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.maxRows = Math.max(1, root.maxRows - 1)
-            }
-            Text {
-              text: String(root.maxRows)
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-            }
-            Button {
-              text: "+"
-              enabled: root.maxRows < 5
-              foreground: Color.popups.text
-              bordered: true
-              onClicked: root.maxRows = Math.min(5, root.maxRows + 1)
-            }
-          }
-
-          RowLayout {
-            width: parent.width
-            spacing: Style.space(6)
-            Text {
-              Layout.fillWidth: true
-              text: "Placement"
-              color: Color.popups.text
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-            }
-            Button {
-              text: "Top"
-              selected: root.captionPosition === "top"
-              foreground: Color.popups.text
-              accent: Color.accent
-              bordered: true
-              onClicked: root.captionPosition = "top"
-            }
-            Button {
-              text: "Bottom"
-              selected: root.captionPosition === "bottom"
-              foreground: Color.popups.text
-              accent: Color.accent
-              bordered: true
-              onClicked: root.captionPosition = "bottom"
-            }
-          }
-
-          Text {
-            visible: root.activeState && !root.demoMode
-            width: parent.width
-            text: "Final captions appear after each local inference chunk"
-              + (root.lastLatencyMs > 0 ? " · estimate " + root.lastLatencyMs + " ms" : "")
-            color: Util.alpha(Color.popups.text, 0.58)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
           }
         }
       }

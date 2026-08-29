@@ -22,7 +22,7 @@ microphone OR desktop monitor
 
 The Quattro entry point implements `open(payloadJson)` and `close()`. The host injects its shell and manifest properties after construction, so those properties are not required during component creation.
 
-One transparent layer-shell window is created for every display. Caption cards use an empty input region, leaving applications beneath clickable. A focused-display control surface provides the interactive Start, Stop, source, size, and position controls without turning the whole overlay into a click target.
+One transparent layer-shell window is created for every display. Caption cards use an empty input region, leaving applications beneath clickable. Their width and height remain inside the display, and a clipped newest-at-bottom viewport keeps the latest caption blocks visible when large text would exceed the available height. A focused-display control surface provides keyboard- and assistive-technology-accessible Start, Stop, source, size, and position controls without turning the whole overlay into a click target. It uses Omarchy's brief exclusive focus prime, settles to on-demand focus, and releases keyboard ownership as soon as the overlay closes. Both kinds of long-lived surface use Omarchy's `ScreenMoveRemap` guard so monitor-origin changes remap them at the compositor's current coordinates. The control card is capped to the available display height; its native scroll viewport automatically reveals whichever button receives keyboard focus.
 
 The root QML object owns one watcher process. Pause and resume travel over that process's stdin. Closing the overlay clears caption text, stops the same QML-owned process, and keeps the invisible QML owner alive long enough for bounded child cleanup.
 
@@ -41,8 +41,8 @@ The helper:
 - starts one `pw-record` process for the chosen source;
 - starts one persistent local `whisper-server` for the chosen model, hard-bound to a random loopback port and tokenized request path;
 - rotates overlapping audio windows through inference;
-- de-duplicates normalized word overlap, with exact-character overlap for unspaced CJK text, and emits bounded caption events;
-- rejects stale audio when the selected model cannot keep up with the live stream;
+- de-duplicates normalized word overlap, with exact-character overlap for unspaced CJK text, and resets that history after a fully silent window;
+- rejects stale audio before emitting an inference result when the selected model cannot keep up with the live stream;
 - stops only processes belonging to its own session;
 - emits deterministic no-audio demo events.
 
@@ -86,7 +86,7 @@ The helper does not create a meeting, transcript database, history, or export. I
 
 ## Process ownership
 
-Every capture run has helper-owned process handles. Quickshell stops the watcher it started; the watcher then signals those exact children and escalates only within their owned process groups after a bounded wait. `setpriv --pdeathsig KILL` is the hard-death fallback if the watcher itself disappears. It cannot target unrelated `pw-record` or `whisper-server` instances.
+Every real capture run starts its watcher through `setpriv --pdeathsig TERM`, the same parent-death contract used by Omarchy's long-lived shell helpers. A shell death therefore asks the watcher to run its normal bounded cleanup. Quickshell stops the watcher it started; the watcher then signals those exact children and escalates only within their owned process groups after a bounded wait. Each owned capture and inference child also starts through `setpriv --pdeathsig KILL`, which is the hard-death fallback if the watcher itself disappears before cleanup completes. Neither layer can target unrelated `pw-record` or `whisper-server` instances.
 
 No predictable shared `/tmp` PID file is trusted, and model/config values are never interpolated into a shell command.
 
@@ -101,7 +101,7 @@ The real-audio path requires `setpriv` from `util-linux`, `pw-record`, and a `wh
 - Inference server exit or stale audio backlog: capture stops instead of leaving a false Listening state.
 - Malformed inference response: last valid captions remain bounded; an error is emitted.
 - Overlay close: Quickshell stops the watcher it owns, whose finalizer terminates capture and inference.
-- Abrupt shell death: parent-death controls terminate owned children where supported; no persisted audio or transcript exists to recover.
+- Abrupt shell death: the watcher's native parent-death signal runs bounded cleanup, while child parent-death signals remain the hard fallback; no persisted audio or transcript exists to recover.
 
 ## Local trust boundary
 
