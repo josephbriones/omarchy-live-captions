@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import io
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,7 +105,7 @@ class ConfigTests(unittest.TestCase):
 
   def test_atomic_config_is_private_and_round_trips(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-      path = Path(temporary) / "nested" / "config.json"
+      path = Path(temporary).resolve() / "nested" / "config.json"
       value = {
         "schemaVersion": 1,
         "model": "/models/ggml-base.en.bin",
@@ -121,6 +122,48 @@ class ConfigTests(unittest.TestCase):
       os.chmod(path, 0o666)
       captions.atomic_write_json(path, value | {"source": "microphone"})
       self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+      self.assertEqual(list(path.parent.glob(".live-captions.*.tmp")), [])
+
+      before_failed_replace = path.read_bytes()
+      with mock.patch.object(captions.os, "replace", side_effect=OSError("replace failed")):
+        with self.assertRaises(captions.CaptionError) as failed_replace:
+          captions.atomic_write_json(path, value)
+      self.assertEqual(failed_replace.exception.code, "invalid-config")
+      self.assertEqual(path.read_bytes(), before_failed_replace)
+      self.assertEqual(list(path.parent.glob(".live-captions.*.tmp")), [])
+
+  def test_atomic_config_preserves_colliding_temporary_file(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      path = Path(temporary).resolve() / "private" / "config.json"
+      captions.ensure_private_directory(path.parent)
+      token = "a" * 24
+      collision = path.parent / f".live-captions.{token}.tmp"
+      collision.write_text("belongs to another writer", encoding="utf-8")
+      os.chmod(collision, 0o600)
+
+      with mock.patch.object(captions.secrets, "token_hex", return_value=token):
+        with self.assertRaises(captions.CaptionError) as caught:
+          captions.atomic_write_json(path, captions.default_config())
+
+      self.assertEqual(caught.exception.code, "invalid-config")
+      self.assertEqual(collision.read_text(encoding="utf-8"), "belongs to another writer")
+      self.assertFalse(path.exists())
+
+  def test_atomic_config_accepts_unsupported_directory_fsync_after_replace(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      path = Path(temporary).resolve() / "private" / "config.json"
+      value = captions.default_config() | {"source": "desktop"}
+      real_fsync = os.fsync
+
+      def fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+          raise OSError(errno.EINVAL, "directory fsync unsupported")
+        real_fsync(descriptor)
+
+      with mock.patch.object(captions.os, "fsync", side_effect=fsync):
+        captions.atomic_write_json(path, value)
+
+      self.assertEqual(captions.load_config(path), value)
 
   def test_language_validation_canonicalizes_supported_bcp47_primary_codes(self) -> None:
     self.assertEqual(captions.validate_language("EN"), "en")
@@ -135,14 +178,154 @@ class ConfigTests(unittest.TestCase):
 
   def test_private_directory_rejects_symlink(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-      root = Path(temporary)
+      root = Path(temporary).resolve()
       target = root / "target"
       target.mkdir()
       link = root / "link"
       link.symlink_to(target, target_is_directory=True)
-      with self.assertRaisesRegex(captions.CaptionError, "symlinked private directory") as caught:
+      with self.assertRaises(captions.CaptionError) as caught:
         captions.ensure_private_directory(link)
       self.assertEqual(caught.exception.code, "unsafe-directory")
+      with mock.patch.object(captions.os, "geteuid", return_value=os.geteuid() + 1):
+        with self.assertRaises(captions.CaptionError) as owner:
+          captions.ensure_private_directory(target)
+      self.assertEqual(owner.exception.code, "unsafe-directory")
+
+  def test_config_rejects_symlinked_ancestor_and_file_without_replacing_targets(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary).resolve()
+      real_directory = root / "real"
+      real_directory.mkdir(mode=0o700)
+      linked_directory = root / "linked"
+      linked_directory.symlink_to(real_directory, target_is_directory=True)
+      with self.assertRaises(captions.CaptionError) as ancestor:
+        captions.atomic_write_json(linked_directory / "config.json", captions.default_config())
+      self.assertEqual(ancestor.exception.code, "unsafe-directory")
+
+      private_directory = root / "private"
+      captions.ensure_private_directory(private_directory)
+      outside = root / "outside.json"
+      outside.write_text("outside", encoding="utf-8")
+      config = private_directory / "config.json"
+      config.symlink_to(outside)
+      with self.assertRaises(captions.CaptionError) as read_link:
+        captions.load_config(config)
+      self.assertEqual(read_link.exception.code, "unsafe-config")
+      with self.assertRaises(captions.CaptionError) as write_link:
+        captions.atomic_write_json(config, captions.default_config())
+      self.assertEqual(write_link.exception.code, "unsafe-config")
+      self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+  @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFOs")
+  def test_config_fifo_is_rejected_without_blocking(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      directory = Path(temporary).resolve() / "private"
+      captions.ensure_private_directory(directory)
+      path = directory / "config.json"
+      os.mkfifo(path, 0o600)
+
+      for operation in (
+        lambda: captions.load_config(path),
+        lambda: captions.atomic_write_json(path, captions.default_config()),
+      ):
+        with self.subTest(operation=operation):
+          outcome: queue.Queue[BaseException | None] = queue.Queue()
+
+          def invoke() -> None:
+            try:
+              operation()
+            except BaseException as error:
+              outcome.put(error)
+            else:
+              outcome.put(None)
+
+          worker = threading.Thread(target=invoke, daemon=True)
+          worker.start()
+          worker.join(timeout=0.5)
+          blocked = worker.is_alive()
+          if blocked:
+            try:
+              writer = os.open(path, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+            except OSError:
+              writer = None
+            if writer is not None:
+              os.close(writer)
+            worker.join(timeout=1.0)
+          self.assertFalse(blocked, "configuration operation blocked while opening a FIFO")
+          caught = outcome.get_nowait()
+          self.assertIsInstance(caught, captions.CaptionError)
+          assert isinstance(caught, captions.CaptionError)
+          self.assertEqual(caught.code, "unsafe-config")
+
+  def test_config_rejects_oversize_directory_and_wrong_owner(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      directory = Path(temporary).resolve() / "private"
+      captions.ensure_private_directory(directory)
+      path = directory / "config.json"
+      path.write_bytes(b" " * (captions.MAX_CONFIG_BYTES + 1))
+      os.chmod(path, 0o600)
+      with mock.patch.object(captions.os, "read", wraps=os.read) as read:
+        with self.assertRaises(captions.CaptionError) as oversized:
+          captions.load_config(path)
+      self.assertEqual(oversized.exception.code, "invalid-config")
+      read.assert_not_called()
+
+      real_fstat = os.fstat
+
+      def stale_size(descriptor: int):
+        info = real_fstat(descriptor)
+        if stat.S_ISREG(info.st_mode):
+          return mock.Mock(
+            st_mode=info.st_mode,
+            st_uid=info.st_uid,
+            st_nlink=info.st_nlink,
+            st_size=0,
+          )
+        return info
+
+      with mock.patch.object(captions.os, "fstat", side_effect=stale_size):
+        with self.assertRaises(captions.CaptionError) as grew_after_open:
+          captions.load_config(path)
+      self.assertEqual(grew_after_open.exception.code, "invalid-config")
+
+      path.unlink()
+      path.mkdir()
+      with self.assertRaises(captions.CaptionError) as directory_target:
+        captions.load_config(path)
+      self.assertEqual(directory_target.exception.code, "unsafe-config")
+
+      path.rmdir()
+      path.write_text(json.dumps(captions.default_config()), encoding="utf-8")
+      os.chmod(path, 0o600)
+      self.assertEqual(captions.load_config(path), captions.default_config())
+
+      alias = directory / "config-alias.json"
+      os.link(path, alias)
+      with self.assertRaises(captions.CaptionError) as hard_link:
+        captions.atomic_write_json(path, captions.default_config())
+      self.assertEqual(hard_link.exception.code, "unsafe-config")
+      alias.unlink()
+
+      real_fstat = os.fstat
+
+      def wrong_owner(descriptor: int):
+        info = real_fstat(descriptor)
+        if stat.S_ISREG(info.st_mode):
+          return mock.Mock(
+            st_mode=info.st_mode,
+            st_uid=os.geteuid() + 1,
+            st_nlink=info.st_nlink,
+            st_size=info.st_size,
+          )
+        return info
+
+      with mock.patch.object(captions.os, "fstat", side_effect=wrong_owner):
+        with self.assertRaises(captions.CaptionError) as owner:
+          captions.load_config(path)
+        with self.assertRaises(captions.CaptionError) as write_owner:
+          captions.atomic_write_json(path, captions.default_config())
+      self.assertEqual(owner.exception.code, "unsafe-config")
+      self.assertEqual(write_owner.exception.code, "unsafe-config")
 
   def test_load_config_rejects_invalid_schema_and_values(self) -> None:
     invalid_values = (
@@ -152,7 +335,7 @@ class ConfigTests(unittest.TestCase):
       {"schemaVersion": 1, "language": "en\r\nInjected"},
     )
     with tempfile.TemporaryDirectory() as temporary:
-      path = Path(temporary) / "config.json"
+      path = Path(temporary).resolve() / "config.json"
       for value in invalid_values:
         with self.subTest(value=value):
           path.write_text(json.dumps(value), encoding="utf-8")
@@ -707,6 +890,31 @@ class DemoAndCliTests(unittest.TestCase):
       self.assertEqual(captions.main(["watch", "--demo"]), 0)
     run_demo.assert_called_once()
 
+  def test_main_surfaces_unsafe_configuration_as_bounded_json(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary).resolve()
+      directory = root / "private"
+      captions.ensure_private_directory(directory)
+      outside = root / "outside.json"
+      outside.write_text("outside", encoding="utf-8")
+      target = directory / "config.json"
+      target.symlink_to(outside)
+      output = io.StringIO()
+      diagnostics = io.StringIO()
+      with (
+        mock.patch.object(captions, "config_path", return_value=target),
+        mock.patch.object(captions, "configure_values", return_value=captions.default_config()),
+        mock.patch.object(captions.sys, "stdout", output),
+        mock.patch.object(captions.sys, "stderr", diagnostics),
+      ):
+        code = captions.main(["configure", "--model", "/unused/model.bin", "--apply"])
+      event = json.loads(output.getvalue())
+      self.assertEqual(code, 1)
+      self.assertEqual((event["ok"], event["code"]), (False, "unsafe-config"))
+      self.assertLessEqual(len(event["message"]), 500)
+      self.assertEqual(diagnostics.getvalue().strip(), event["message"])
+      self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
 
 class CleanupTests(unittest.TestCase):
   class _OwnedChild:
@@ -727,7 +935,7 @@ class CleanupTests(unittest.TestCase):
 
   def test_session_cleanup_is_idempotent_and_terminates_capture(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-      runtime = Path(temporary)
+      runtime = Path(temporary).resolve()
       model = runtime / "model.bin"
       model.write_bytes(b"fixture")
       with mock.patch.object(captions, "reserve_loopback_port", return_value=43008):

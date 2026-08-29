@@ -82,7 +82,7 @@ Practical latency is window completion plus inference, queueing, and local hando
 
 ## Data lifetime
 
-The helper does not create a meeting, transcript database, history, or export. It holds a bounded transcript tail and rolling PCM/WAV windows in memory, discarding each window after local inference. Its mode-`0700` XDG runtime directory contains only a mode-`0600` single-session lock—not caption text or audio. Preferences at `$XDG_CONFIG_HOME/omarchy/live-captions/config.json` store only model/source/language settings.
+The helper does not create a meeting, transcript database, history, or export. It holds a bounded transcript tail and rolling PCM/WAV windows in memory, discarding each window after local inference. Its mode-`0700` XDG runtime directory contains only a mode-`0600` single-session lock—not caption text or audio. Preferences at `$XDG_CONFIG_HOME/omarchy/live-captions/config.json` store only model/source/language settings. The helper traverses configuration directories with no-follow directory descriptors, requires a private user-owned leaf, and reads only a bounded user-owned regular file. Updates use a mode-`0600` temporary file, file and directory sync, and an atomic same-directory descriptor-relative replacement. Unsafe or malformed configuration produces a bounded setup error instead of being followed or consumed.
 
 ## Process ownership
 

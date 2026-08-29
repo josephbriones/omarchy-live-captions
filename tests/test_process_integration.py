@@ -235,7 +235,7 @@ class WatchProcessIntegrationTests(unittest.TestCase):
 
   def test_real_subprocess_pipeline_captions_and_reaps_children(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-      work = Path(temporary)
+      work = Path(temporary).resolve()
       model = work / "ggml-base.en.bin"
       model.write_bytes(b"fake integration model")
       server = write_executable(work / "whisper-server", FAKE_WHISPER_SERVER)
