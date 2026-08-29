@@ -21,8 +21,9 @@ Live Captions keeps a small operational surface:
 - It executes its bundled standard-library Python helper, `setpriv`, `pw-record`, and `whisper-server`.
 - It has no `sudo`, package installation, download hook, remote API, analytics, or public listener.
 - Local inference is hard-bound to `127.0.0.1` on an OS-assigned ephemeral port, behind a per-run random 128-bit request path and an empty private public directory. The random path prevents accidental cross-talk; it is not authentication against same-user processes that can inspect the process table.
-- The private XDG runtime directory is mode `0700`; its single-session lock is mode `0600`.
-- Model and configuration paths are validated before use and passed as argument values, never evaluated as shell source.
+- Private runtime and configuration leaf directories are mode `0700`; the session lock and configuration file are mode `0600`.
+- Configuration directory components are opened relative to verified directory descriptors without following symlinks. Reads accept only a bounded, single-link, user-owned regular file; writes replace it atomically through a same-directory private temporary file and durable directory sync.
+- Model and configuration values are validated before use and passed as argument values, never evaluated as shell source.
 - Structured events use standard output; diagnostics use standard error.
 - Quickshell keeps the lightweight QML owner resident, but audio starts only after an explicit Start action. It owns the watcher directly and sends pause/resume over its private stdin pipe. While paused, `pw-record` keeps running and linked; the helper drains and discards new PCM and suppresses caption output. The one window already being prepared or requested may finish locally, but no later window starts until Resume. Stop or Close ends capture; the helper then signals only live `Popen` children in the process groups it created. No PID file or process-name match is trusted.
 - The shell launches the real watcher with `setpriv --pdeathsig TERM`, matching Omarchy's native long-lived-helper contract and allowing bounded cleanup after an abrupt shell exit. Each recorder and inference process also uses mandatory `setpriv --pdeathsig KILL` as the hard fallback if its watcher disappears first.
@@ -46,4 +47,4 @@ These are local same-user boundaries, not isolation from other software in the d
 - Store models in user-owned, non-world-writable paths.
 - Do not run the helper as root.
 
-Automated tests cover process ownership, bounded data, sanitization, stale-backlog failure, and cleanup, including a deterministic fake-command subprocess pipeline. They do not exercise real Omarchy hardware and are not a security audit.
+Automated tests cover process ownership, bounded data, configuration symlink/FIFO/size/ownership rejection, sanitization, stale-backlog failure, and cleanup, including a deterministic fake-command subprocess pipeline. They do not exercise real Omarchy hardware and are not a security audit.

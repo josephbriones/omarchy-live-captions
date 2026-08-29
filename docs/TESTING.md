@@ -25,7 +25,7 @@ GitHub Actions also runs an Arch container with `jq`, Quickshell, and Qt Declara
 
 ## Current v0.2 evidence
 
-The deterministic automated suite exercises the local HTTP protocol, real subprocess creation and cleanup, the Linux `setpriv` parent-death boundary, first-PCM readiness, pause boundaries, stale-backlog failure, bounded output, and event parsing. Its fake commands do not use PipeWire, a real Whisper model, or physical audio hardware.
+The deterministic automated suite exercises the local HTTP protocol, real subprocess creation and cleanup, the Linux `setpriv` parent-death boundary, first-PCM readiness, pause boundaries, stale-backlog failure, bounded output, and event parsing. Configuration tests also cover no-follow ancestor and file handling, nonblocking FIFO rejection, pre-read size limits, user ownership, private permissions, and atomic replacement cleanup. Its fake commands do not use PipeWire, a real Whisper model, or physical audio hardware.
 
 No completed v0.2 Omarchy-hardware run is recorded in this repository. Microphone capture, desktop-monitor capture, multiple physical displays, observed end-to-caption latency, and loading the plugin in a running Omarchy session remain separate environment-dependent gates. The pinned CI contract does not substitute for those hardware checks.
 

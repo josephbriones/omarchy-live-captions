@@ -13,6 +13,7 @@ from array import array
 from collections import deque
 import contextlib
 from dataclasses import dataclass
+import errno
 import fcntl
 import http.client
 import io
@@ -29,7 +30,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Sequence
@@ -50,6 +50,7 @@ READ_BYTES = 4096
 MAX_QUEUE_CHUNKS = 64
 MAX_HTTP_RESPONSE = 1_048_576
 MAX_CAPABILITY_OUTPUT = 262_144
+MAX_CONFIG_BYTES = 16_384
 CAPTURE_START_TIMEOUT = 5.0
 MAX_CAPTURE_BACKLOG_SECONDS = WINDOW_SECONDS - OVERLAP_SECONDS
 # Conservative silence-only gate (~-54 dBFS), not an aggressive speech VAD.
@@ -176,16 +177,89 @@ def runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
   return base / "omarchy-live-captions"
 
 
+def _absolute_path_parts(path: Path) -> tuple[str, ...]:
+  candidate = Path(path)
+  if not candidate.is_absolute():
+    raise CaptionError("unsafe-directory", f"Private paths must be absolute: {candidate}")
+  parts = candidate.parts[1:]
+  if not parts or any(part in ("", ".", "..") for part in parts):
+    raise CaptionError("unsafe-directory", f"Refusing an unsafe private path: {candidate}")
+  return parts
+
+
+def _open_private_directory(path: Path, *, create: bool, repair_mode: bool) -> int:
+  """Open a private leaf without following any directory component."""
+  parts = _absolute_path_parts(path)
+  directory_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+  )
+  try:
+    descriptor = os.open(os.path.sep, directory_flags)
+  except OSError as error:
+    raise CaptionError("unsafe-directory", f"Could not open the filesystem root safely: {error}") from error
+  traversed = Path(os.path.sep)
+  try:
+    for part in parts:
+      traversed /= part
+      try:
+        child = os.open(part, directory_flags, dir_fd=descriptor)
+      except FileNotFoundError:
+        if not create:
+          raise
+        try:
+          os.mkdir(part, 0o700, dir_fd=descriptor)
+        except FileExistsError:
+          pass
+        try:
+          child = os.open(part, directory_flags, dir_fd=descriptor)
+        except OSError as error:
+          raise CaptionError(
+            "unsafe-directory",
+            f"Could not safely open private directory component {traversed}: {error}",
+          ) from error
+      except OSError as error:
+        raise CaptionError(
+          "unsafe-directory",
+          f"Could not safely open private directory component {traversed}: {error}",
+        ) from error
+      os.close(descriptor)
+      descriptor = child
+
+    info = os.fstat(descriptor)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+      raise CaptionError(
+        "unsafe-directory",
+        f"Private directory must be a user-owned directory: {path}",
+      )
+    if repair_mode:
+      os.fchmod(descriptor, 0o700)
+      info = os.fstat(descriptor)
+    if stat.S_IMODE(info.st_mode) != 0o700:
+      raise CaptionError(
+        "unsafe-directory",
+        f"Private directory permissions must be 0700: {path}",
+      )
+    return descriptor
+  except (CaptionError, FileNotFoundError):
+    os.close(descriptor)
+    raise
+  except OSError as error:
+    os.close(descriptor)
+    raise CaptionError(
+      "unsafe-directory",
+      f"Could not prepare private directory {path}: {error}",
+    ) from error
+  except BaseException:
+    os.close(descriptor)
+    raise
+
+
 def ensure_private_directory(path: Path) -> Path:
-  if path.is_symlink():
-    raise CaptionError("unsafe-directory", f"Refusing a symlinked private directory: {path}")
-  path.mkdir(mode=0o700, parents=True, exist_ok=True)
-  info = path.lstat()
-  if info.st_uid != os.getuid():
-    raise CaptionError("unsafe-runtime", f"Runtime directory is not owned by the current user: {path}")
-  if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-    raise CaptionError("unsafe-runtime", f"Runtime path is not a directory: {path}")
-  os.chmod(path, 0o700)
+  descriptor = _open_private_directory(path, create=True, repair_mode=True)
+  os.close(descriptor)
   return path
 
 
@@ -216,13 +290,31 @@ def validate_source(value: object) -> str:
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
-  target = config_path() if path is None else path
+  target = config_path() if path is None else Path(path)
+  name = _config_filename(target)
   values = default_config()
-  if not target.exists():
+  try:
+    directory = _open_private_directory(target.parent, create=False, repair_mode=False)
+  except FileNotFoundError:
     return values
   try:
-    raw = json.loads(target.read_text(encoding="utf-8"))
-  except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    try:
+      descriptor = _open_config_file(directory, name)
+    except FileNotFoundError:
+      return values
+    try:
+      payload = _read_bounded_config(descriptor)
+    finally:
+      os.close(descriptor)
+  except CaptionError:
+    raise
+  except OSError as error:
+    raise CaptionError("invalid-config", f"Could not read Live Captions configuration: {error}") from error
+  finally:
+    os.close(directory)
+  try:
+    raw = json.loads(payload.decode("utf-8", "strict"))
+  except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
     raise CaptionError("invalid-config", f"Could not read Live Captions configuration: {error}") from error
   if not isinstance(raw, dict):
     raise CaptionError("invalid-config", "Live Captions configuration must be a JSON object.")
@@ -237,27 +329,149 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
   return values
 
 
-def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
-  ensure_private_directory(path.parent)
-  if path.exists() and path.is_dir():
-    raise CaptionError("invalid-config", f"Configuration path is a directory: {path}")
-  descriptor, temporary_name = tempfile.mkstemp(prefix=".live-captions.", suffix=".json", dir=path.parent)
-  temporary = Path(temporary_name)
+def _config_filename(path: Path) -> str:
+  name = path.name
+  if not name or name in (".", "..") or os.path.sep in name:
+    raise CaptionError("invalid-config", f"Refusing an unsafe configuration filename: {path}")
+  return name
+
+
+def _validate_config_file(info: os.stat_result) -> None:
+  if (
+    not stat.S_ISREG(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or info.st_nlink != 1
+  ):
+    raise CaptionError(
+      "unsafe-config",
+      "Live Captions configuration must be a user-owned regular file with one link.",
+    )
+  if info.st_size > MAX_CONFIG_BYTES:
+    raise CaptionError(
+      "invalid-config",
+      f"Live Captions configuration exceeds {MAX_CONFIG_BYTES} bytes.",
+    )
+
+
+def _open_config_file(directory: int, name: str) -> int:
+  flags = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+  )
   try:
-    os.fchmod(descriptor, 0o600)
-    payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    with os.fdopen(descriptor, "wb", closefd=True) as handle:
-      handle.write(payload)
-      handle.flush()
-      os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    os.chmod(path, 0o600)
-  except BaseException:
-    with contextlib.suppress(OSError):
-      os.close(descriptor)
-    with contextlib.suppress(OSError):
-      temporary.unlink()
+    descriptor = os.open(name, flags, dir_fd=directory)
+  except FileNotFoundError:
     raise
+  except OSError as error:
+    raise CaptionError("unsafe-config", f"Could not safely open Live Captions configuration: {error}") from error
+  try:
+    _validate_config_file(os.fstat(descriptor))
+    return descriptor
+  except BaseException:
+    os.close(descriptor)
+    raise
+
+
+def _read_bounded_config(descriptor: int) -> bytes:
+  chunks = bytearray()
+  while len(chunks) <= MAX_CONFIG_BYTES:
+    chunk = os.read(descriptor, min(8192, MAX_CONFIG_BYTES + 1 - len(chunks)))
+    if not chunk:
+      break
+    chunks.extend(chunk)
+  if len(chunks) > MAX_CONFIG_BYTES:
+    raise CaptionError(
+      "invalid-config",
+      f"Live Captions configuration exceeds {MAX_CONFIG_BYTES} bytes.",
+    )
+  return bytes(chunks)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+  written = 0
+  while written < len(payload):
+    count = os.write(descriptor, payload[written:])
+    if count <= 0:
+      raise OSError("configuration write made no progress")
+    written += count
+
+
+def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+  path = Path(path)
+  name = _config_filename(path)
+  try:
+    payload = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+  except (TypeError, ValueError, UnicodeError) as error:
+    raise CaptionError("invalid-config", "Could not serialize Live Captions configuration.") from error
+  if len(payload) > MAX_CONFIG_BYTES:
+    raise CaptionError(
+      "invalid-config",
+      f"Live Captions configuration exceeds {MAX_CONFIG_BYTES} bytes.",
+    )
+  directory = _open_private_directory(path.parent, create=True, repair_mode=True)
+  descriptor: int | None = None
+  temporary_name = ""
+  try:
+    try:
+      existing = _open_config_file(directory, name)
+    except FileNotFoundError:
+      existing = None
+    if existing is not None:
+      os.close(existing)
+
+    flags = (
+      os.O_WRONLY
+      | os.O_CREAT
+      | os.O_EXCL
+      | getattr(os, "O_NOFOLLOW", 0)
+      | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _attempt in range(32):
+      candidate = f".live-captions.{secrets.token_hex(12)}.tmp"
+      try:
+        descriptor = os.open(candidate, flags, 0o600, dir_fd=directory)
+        temporary_name = candidate
+        break
+      except FileExistsError:
+        continue
+    if descriptor is None:
+      raise CaptionError("invalid-config", "Could not allocate a private configuration file.")
+    os.fchmod(descriptor, 0o600)
+    _write_all(descriptor, payload)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = None
+    os.replace(
+      temporary_name,
+      name,
+      src_dir_fd=directory,
+      dst_dir_fd=directory,
+    )
+    temporary_name = ""
+    try:
+      os.fsync(directory)
+    except OSError as error:
+      unsupported = {
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+      }
+      if error.errno not in unsupported:
+        raise
+  except CaptionError:
+    raise
+  except OSError as error:
+    raise CaptionError("invalid-config", f"Could not write Live Captions configuration: {error}") from error
+  finally:
+    if descriptor is not None:
+      with contextlib.suppress(OSError):
+        os.close(descriptor)
+    if temporary_name:
+      with contextlib.suppress(OSError):
+        os.unlink(temporary_name, dir_fd=directory)
+    os.close(directory)
 
 
 def english_only_model(path: Path) -> bool:

@@ -18,6 +18,10 @@ All notable changes are documented here. Versions follow [Semantic Versioning](h
 - Add pinned Arch CI coverage for Omarchy validation and `qmllint` against the current shell imports.
 - Launch the real watcher with Omarchy's native `setpriv --pdeathsig TERM` process contract instead of a private `ctypes`/`prctl` shim.
 
+### Security
+
+- Harden configuration storage with no-follow descriptor traversal, bounded regular-file reads, private ownership checks, and atomic descriptor-relative replacement.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
